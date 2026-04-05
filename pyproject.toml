@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stareviz"
+version = "0.1.0"
+description = "Interactive visualizer for STAREVOL stellar evolution models"
+authors = [{ name = "Sviatoslav Borisov", email = "borisov.sviat@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "dash==3.2.0",
+    "plotly>=5.18",
+    "PyYAML>=6.0",
+]
+
+
+[project.scripts]
+stareviz = "stareviz.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stareviz*"]
+
+[tool.setuptools.package-data]
+stareviz = ["stareviz.yml"]

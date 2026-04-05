@@ -1,0 +1,165 @@
+# =====================================================================
+#  STAREVIZ — User Configuration
+#  Edit this file to customize the appearance and behaviour of STAREVIZ
+# =====================================================================
+
+
+# ------------------------------------------------------------
+#  Default model directories
+#  Loaded automatically when stareviz is called without arguments.
+#  Can be a single path or a list of paths.
+#  Supports ~ for home directory.
+# ------------------------------------------------------------
+default_roots:
+  - /Users/sviatoslavborisov/STAREVOL/RESEVOL/
+
+
+
+# ------------------------------------------------------------
+#  Model list sort order
+#  Controls how models are sorted in the sidebar list.
+#  Options:
+#    name        — alphabetical by folder name  (default)
+#    created     — by folder creation date, newest first
+#    last_opened — by last time opened in stareviz, most recent first
+# ------------------------------------------------------------
+model_sort_order: name
+model_sort_ascending: true # true = ascending (A->Z / oldest first), false = descending (Z->A / newest first)
+
+
+
+# ------------------------------------------------------------
+# Solar mixture
+# Options:
+# GN93 - Grevesse & Noels (1993), alpha_MLT=1.6865
+# AY18 - Asplund+09 + Ne enh. (Young+18) for solar model with at. diff. and rot., KS66, alpha_MLT=2.2236
+# AAD - Asplund+09 for solar model with at. diff. and rot., KS66, alpha_MLT=2.1987
+# AGSS09 - Asplund+09 calibrated for solar model without at. diff., alpha_MLT = 1.6267
+# AGS05 - Asplund+05 calibrated for solar model without at. diff., alpha_MLT = 1.6046
+# ------------------------------------------------------------
+solar_mixture: AAD   # GN93 | AY18 | AAD | AGSS09 | AGS05
+
+
+
+# ------------------------------------------------------------
+#  Track lines  (HRD and other regular plots)
+# ------------------------------------------------------------
+track_line_width: 2.0         # base line width in pixels for the first 10 models
+track_line_width_step: 1.5    # added to line width every 10 models (to visually distinguish groups)
+track_multicolor: true        # true = each model gets a different color (default cycle of 10 colors)
+                              # false = all models use track_single_color (see below)
+track_single_color: "#636EFA" # color used when track_multicolor is false (default: Plotly blue)
+
+
+
+# ------------------------------------------------------------
+#  Evolutionary phase colours  (used when "Show phase" is on)
+#  Colours can be specified as:
+#    - a hex string:            "#ff6600"
+#    - an RGB  string:          "rgb(255, 102, 0)"
+#    - a named CSS colour:      "tomato"
+#  See the hex and RGB codes of colors, e.g. at https://share.google/A5B2vpHaXzSRBcTsE
+# ------------------------------------------------------------
+phase_colors:
+  1: "#0bdbdb"   # PMS  — cyan
+  2: "black"     # MS — black
+  3: "#07d63b"   # SGB/RGB   — green
+  4: "blue"      # HB  — blue
+  5: "red"       # AGB  — red
+
+
+
+# ------------------------------------------------------------
+#  Kippenhahn diagram colours
+# ------------------------------------------------------------
+kipp:
+  # Convective zones (envelope + internal zones conv1–conv5)
+  conv_fill:        "rgba(0,128,0,0.18)"    # fill inside convective zone
+  conv_line:        "rgba(0,100,0,0.35)"    # border of convective zone
+  rings:            "rgba(0,90,0,0.40)"     # rings inside convective zones
+  rings_size: 5          # marker size in pixels (larger = bigger rings)
+  rings_line_width: 1    # line thickness of the ring circles in pixels
+  rings_ny: 50      # rings per column — vertical density (more = denser)
+  rings_nx: 60      # rings per row — horizontal density (more = denser)
+  # Radiative-zone background masks per evolutionary phase
+  # Opacity is shared for all masks
+  mask_opacity: 0.5
+  mask_pms: "173,216,230"   # light blue    — Pre-Main Sequence
+  mask_ms: "255,255,204"    # light yellow  — Main Sequence
+  mask_gb: "255,200,120"    # orange        — SGB/RGB
+  mask_hb: "255,140,100"    # salmon        — Horizontal Branch
+  mask_agb: "255,100,140"   # pink          — AGB
+  # Thermohaline mixing zone (conv6)
+  show_thermo:  true    # true (default) - show; false - do not show
+  thermo_fill:  "rgba(250,0,100,0.4)"  # reddish fill
+  thermo_line:  "rgba(255,0,30,0.6)"   # reddish border
+  # Boundary lines colours (base of envelope, stellar surface)
+  boundary_line:    "rgba(0,90,0,0.70)"
+  # Smooth phase transitions
+  # transition_steps: number of gradient strips at each phase boundary (0 = sharp transition, no gradient)
+  # transition_frac: fractional width (in age) of the transition zone
+  # transition_frac_pms: fractional width for the PMS->MS transition specifically
+  transition_steps: 0      # 0 = sharp (default); >=2 smooth gradient (tip: better put values between 10 and <~20)
+  transition_frac: 0.01
+  transition_frac_pms: 0.05
+
+
+
+# ------------------------------------------------------------
+#  Freeze / snapshot overlay
+# ------------------------------------------------------------
+freeze_opacity: 0.5   # Opacity of the frozen background layer (0.0 = invisible, 1.0 = fully opaque)
+
+
+
+# ------------------------------------------------------------
+#  Plot grid
+# ------------------------------------------------------------
+grid:
+  opacity: 0.05   # Opacity of the grid lines (0.0 = invisible, 1.0 = fully opaque)
+  width: 1        # Width of grid lines in pixels
+
+
+
+# ------------------------------------------------------------
+#  Legend
+# ------------------------------------------------------------
+legend:
+  font_size: 18   # font size of model names in the legend
+  max_chars:      # max characters to show from model name (leave empty = full name)
+
+
+
+# ------------------------------------------------------------
+#  Graph titles font
+# ------------------------------------------------------------
+axis_title_font_size: 18   # font size of X and Y-axis titles
+axis_tick_font_size:  17   # font size of X and Y-axis tick labels
+
+
+
+# ------------------------------------------------------------
+#  Isochrone sort
+#  Controls how points on the isochrone are connected.
+#  isochrone_sort_by: any parameter name from AXIS_LABELS_PLOT
+#    (e.g. logg, Teff, L, Reff, M,  ...)
+#  isochrone_sort_ascending: true = smallest first, false = largest first
+# ------------------------------------------------------------
+isochrone_sort_by: logg           # logg recommended in most cases (also consider M for similar chem. comp.)
+isochrone_sort_ascending: false   # false = descending (if logg, then physically correct for HR diagram)
+# Age marker (dot on each track at the selected age)
+isochrone:
+  marker_color:        red     # colour of the age marker dot
+  marker_size:         10      # size in pixels
+  marker_border_width: 1.5     # border thickness in pixels (colour is always black)
+  line_color:          black   # colour of the isochrone line
+  line_width:          1.5     # thickness of the isochrone line in pixels
+
+
+
+# ------------------------------------------------------------
+# Tick multupliers for Log scale. E.g., [1, 2, 5] corresponds to ticks at 1×10^N, 2×10^N, 5×10^N.
+# In the example provided, labels at 2×10^N and 5×10^N would be just "2" and "5" (without "×10^N")
+# and shown with a bit smaller font.
+# ------------------------------------------------------------
+log_tick_multipliers: [1, 2, 5]
