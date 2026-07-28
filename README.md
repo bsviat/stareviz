@@ -18,15 +18,15 @@ Built with [Dash](https://dash.plotly.com/) + [Plotly](https://plotly.com/python
 | **HR diagram & arbitrary 2D plots** | Any parameter on X/Y: Teff, L, logg, age, mass, rotation, abundances, … |
 | **Kippenhahn diagram** | Convective zones, thermohaline mixing, phase-coded radiative background |
 | **Isochrones** | Connect equal-age points across models; configurable sort order and styling |
-| **Freeze / snapshot overlay** | Freeze the current plot as a semi-transparent background layer; stack multiple frozen layers |
-| **Evolutionary phase coloring** | Color tracks by phase (PMS / MS / SGB+RGB / HB / AGB) with phase range filter |
+| **Freeze / snapshot overlay** | Freeze the current plot as a semi-transparent background layer |
+| **Evolutionary phase coloring** | Color tracks by phase (PMS / MS / SGB+RGB / HB / AGB) |
 | **Abundance formats** | X(X), A(X), [X/H], [X/M] — computed on the fly from mass fractions |
 | **Fast mode** | Load only `.hr` files for quick HR/Kiel diagram browsing of large grids |
 | **Multi-model loading** | Search and load any number of models; sidebar checklist with live search |
 | **Multi-model folders** | Folders with multiple model files are shown as collapsible groups in the sidebar |
 | **Per-model cache reload** | 🔄 button on hover reloads a single model from disk without restarting the app |
 | **Export to PNG** | Auto-named output files (e.g. `Li7surf_vs_Age_3_models.png`) |
-| **Fully configurable** | Colors, line widths, font sizes, grid, legend, isochrone style — all via `stareviz.yml` |
+| **Fully configurable** | Colors, line widths, font sizes, grid, legend, etc. — all via `stareviz.yml` |
 
 ---
 
