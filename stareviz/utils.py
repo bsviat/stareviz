@@ -15,10 +15,11 @@ def get_forced_axis_scale(param: Optional[str]) -> Optional[str]:
     - parameter starts with "log" (e.g. logg, logL, logTeff)
     - parameter is in FORCED_AXIS_SCALE_KEYS
 
-    Returns "lin" if:
-    - parameter is "__kipp_env" or "__kipp_env_r" (Kippenhahn diagram)
-
-    These parameters are locked — other scale modes are unavailable.
+    The Kippenhahn diagram ("__kipp_env") is special-cased outside this
+    function: whether its Y scale is locked to "lin" (mass coordinate) or
+    also allows "log" (radius coordinate) depends on the M/R radio button
+    next to the Y dropdown, which this param-only helper has no access to
+    — see sync_yscale and the kipp_radius_mode branch in render().
     """
     if param is None:
         return None
@@ -38,10 +39,6 @@ def get_forced_axis_scale(param: Optional[str]) -> Optional[str]:
     # geff is log(g) under a different name, lock to "log(x)"
     if param_str == "geff":
         return "log(x)"
-
-    # Kippenhahn diagram — lin only
-    if param_str in ("__kipp_env", "__kipp_env_r"):
-        return "lin"
 
     # Check explicitly defined keys
     if str(param) in FORCED_AXIS_SCALE_KEYS:

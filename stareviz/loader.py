@@ -22,61 +22,91 @@ CANDIDATES = {
 }
 
 
+# Compiled once at module load — reused for every file read
+_RE_EXOTIC_SPACES = re.compile(r"[\xa0\u202f\u2007]")
+_RE_MARKERS    = re.compile(r"[@<\|]+")
+_RE_FORTRAN_D  = re.compile(r"[dD]([+\-]?\d+)")
+_RE_LEADING_WS = re.compile(r"^[ \t]+", re.MULTILINE)
+_RE_MULTI_WS   = re.compile(r"[ \t]+")
+
+
 def _open_text(path: Path):
     return gzip.open(path, "rt", encoding="utf-8", errors="ignore") if str(path).endswith(".gz") \
         else open(path, "rt", encoding="utf-8", errors="ignore")
 
+
+
 def _read_starevol_table(path: Path) -> pd.DataFrame:
     with _open_text(path) as f:
-        lines = f.readlines()
+        text = f.read()
 
-    # normalize exotic spaces (NBSP, narrow NBSP, figure space)
-    lines = [ln.replace("\xa0", " ").replace("\u202f", " ").replace("\u2007", " ") for ln in lines]
+    # Single-pass exotic space normalization via C regex (releases GIL, unlike str.replace chains)
+    text = _RE_EXOTIC_SPACES.sub(" ", text)
 
+    # Find header by scanning only the first 100 lines with str.find() — avoids splitlines()
+    # on the full file (splitlines creates 338k Python string objects and holds the GIL).
+    pos = 0
     header_idx = None
-    for i, line in enumerate(lines):
-        # match 'model' with any leading spaces/tabs/non-breaking spaces
-        if re.match(r"\s*model(\s|$)", line, flags=re.IGNORECASE):
+    header_cols = None
+    for i in range(100):
+        nl = text.find("\n", pos)
+        line = text[pos:nl] if nl != -1 else text[pos:]
+        if re.match(r"\s*model(\s|$)", line, re.IGNORECASE):
             header_idx = i
+            header_cols = re.split(r"\s+", line.strip())
+            pos = nl + 1 if nl != -1 else len(text)
             break
+        pos = (nl + 1) if nl != -1 else len(text)
+
     if header_idx is None:
         return _read_any_table_fallback(path)
 
-    header_cols = re.split(r"\s+", lines[header_idx].strip())
+    need = len(header_cols)
 
-    dash_idx = None
-    for j in range(header_idx + 1, min(header_idx + 6, len(lines))):
-        if set(lines[j].strip()) <= set("-"):
-            dash_idx = j
+    # Find optional dash separator in the next few lines
+    for _ in range(5):
+        nl = text.find("\n", pos)
+        line = text[pos:nl] if nl != -1 else text[pos:]
+        stripped = line.strip()
+        if stripped and set(stripped) <= {"-"}:
+            pos = (nl + 1) if nl != -1 else len(text)
             break
-    data_start = (dash_idx + 1) if dash_idx is not None else (header_idx + 1)
+        pos = (nl + 1) if nl != -1 else len(text)
 
-    data_lines = []
-    need = len(header_cols)
+    # Slice data block directly — one O(n) copy instead of splitlines()+join() which
+    # creates and GC-s 338k intermediate string objects while holding the GIL.
+    data_text = text[pos:]
 
-    for ln in lines[data_start:]:
-        ln = ln.replace("\xa0", " ").replace("\u202f", " ").replace("\u2007", " ")
-        ln = re.sub(r"[@<\|]+", " ", ln)
-        ln = re.sub(r"\s+", " ", ln.strip())
-        if not ln:
-            continue
+    # Bulk transforms: all four regex subs release the GIL during C-level processing,
+    # enabling true parallelism when multiple files are read in a thread pool.
+    data_text = _RE_MARKERS.sub(" ", data_text)
+    data_text = _RE_FORTRAN_D.sub(r"E\1", data_text)
+    data_text = _RE_LEADING_WS.sub("", data_text)
+    data_text = _RE_MULTI_WS.sub(" ", data_text)
 
-        parts = ln.split(" ")
-        if len(parts) < need:
-            continue
-        parts = parts[:need]
-        data_lines.append(" ".join(parts))
+    buf = StringIO(data_text)
+    try:
+        df_raw = pd.read_csv(
+            buf,
+            sep=" ",
+            header=None,
+            engine="c",
+            usecols=list(range(need)),
+            on_bad_lines="skip",
+        ).dropna(axis=1, how="all")
+    except Exception:
+        buf = StringIO(data_text)
+        try:
+            df_raw = pd.read_csv(
+                buf,
+                sep=r"\s+",
+                header=None,
+                engine="python",
+                on_bad_lines="skip",
+            ).dropna(axis=1, how="all")
+        except Exception:
+            return _read_any_table_fallback(path)
 
-    buf = StringIO("\n".join(data_lines))
-
-    df_raw = pd.read_csv(
-        buf,
-        sep=r"\s+",
-        header=None,
-        engine="python",
-    ).dropna(axis=1, how="all")
-
-    need = len(header_cols)
     if df_raw.shape[1] < need:
         return _read_any_table_fallback(path)
 
@@ -85,11 +115,7 @@ def _read_starevol_table(path: Path) -> pd.DataFrame:
 
     for c in df.columns:
         if df[c].dtype == object:
-            s = df[c].astype(str)
-            s = s.str.replace(r"[@<\|]+$", "", regex=True)  # drop trailing markers
-            s = s.str.replace(r"[dD]([+\-]?\d+)", r"E\1", regex=True)  # FORTRAN exponent D→E
-            s = s.str.replace(r"[^0-9\.\+\-eE]", "", regex=True)  # keep numeric tokens
-            df[c] = pd.to_numeric(s, errors="coerce")
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     if "model" in df.columns:
         df = df[df["model"].notna()]
@@ -138,8 +164,11 @@ def _pick_first(paths: list[Path], patterns: list[str]) -> Optional[Path]:
     return None
 
 
-def _collect_files(model_dir: Path) -> list[Path]:
-    return list(model_dir.glob("*"))
+def _collect_files(model_dir: Path, stem: Optional[str] = None) -> list[Path]:
+    files = list(model_dir.glob("*"))
+    if stem is not None:
+        files = [f for f in files if f.name.startswith(stem + ".")]
+    return files
 
 
 def _merge_on_age(base: pd.DataFrame, extra: pd.DataFrame, tol_myr: float = 0.05) -> pd.DataFrame:
@@ -189,8 +218,8 @@ def _extract_scalar(df: pd.DataFrame, key: str, target_name: str) -> pd.DataFram
     return out
 
 
-def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
-    files = _collect_files(model_dir)
+def load_one_model(model_dir: Path, stem: Optional[str] = None, verbose: bool = False) -> pd.DataFrame:
+    files = _collect_files(model_dir, stem)
     if not files:
         raise FileNotFoundError(f"No files in {model_dir}")
 
@@ -202,72 +231,54 @@ def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
         if v13_files:
             print(f"v13 files: {v13_files}")
         else:
-            print("⚠ v13 files NOT found!")
+            print("\u26a0 v13 files NOT found!")
         print(f"{'=' * 80}\n")
 
     main_file = _pick_first(files, ["*.hr.gz", "*.hr", "*.track.gz", "*.track", "*.dat.gz", "*.dat", "*.csv"])
     if not main_file:
         main_file = sorted(files)[0]
 
-    base = _read_any_table(main_file)
-    base = _standardize_main(base).reset_index(drop=True)
+    base = _standardize_main(_read_any_table(main_file)).reset_index(drop=True)
 
-    # Helper function to merge additional files by model number
-    def merge_file(pattern: str, prefix: str = None, debug_name: str = None):
-        nonlocal base
-        f = _pick_first(files, pattern if isinstance(pattern, list) else [pattern])
+    aux_specs = (
+        [([f"*.v{i}.gz", f"*.v{i}", f"*v{i}.gz", f"*v{i}"], None, f"v{i}") for i in range(1, 14)]
+        + [
+            (["*.tc1.gz", "*.tc1", "*tc1.gz", "*tc1"], None, "tc1"),
+            (["*.tc2.gz", "*.tc2", "*tc2.gz", "*tc2"], None, "tc2"),
+            (["*.as.gz", "*.as"], None, "as"),
+        ]
+        + [([f"*.s{i}.gz", f"*.s{i}"], "s_", f"s{i}") for i in range(1, 5)]
+        + [([f"*.c{i}.gz", f"*.c{i}"], "c_", f"c{i}") for i in range(1, 5)]
+    )
+
+    for patterns, prefix, label in aux_specs:
+        f = _pick_first(files, patterns)
         if not f:
             if verbose:
-                print(f"  - {debug_name or pattern}: file not found")
-            return
-
+                print(f"  - {label}: file not found")
+            continue
         try:
             df = _read_any_table(f)
         except Exception as e:
             if verbose:
-                print(f"  - {debug_name or f.name}: read error - {e}")
-            return
-
+                print(f"  - {label}: read error - {e}")
+            continue
         if "model" not in df.columns:
             if verbose:
-                print(f"  - {debug_name or f.name}: no 'model' column (columns: {list(df.columns)[:5]}...)")
-            return
-
+                print(f"  - {label}: no 'model' column (columns: {list(df.columns)[:5]}...)")
+            continue
         df.columns = [c.strip() for c in df.columns]
-
-        # Add prefix to columns (except 'model')
         if prefix:
-            rename_map = {c: f"{prefix}{c}" for c in df.columns if c != "model"}
-            df = df.rename(columns=rename_map)
-
-        # Remove 'model' from df before merge to avoid duplicate
+            df = df.rename(columns={c: f"{prefix}{c}" for c in df.columns if c != "model"})
         cols_to_merge = [c for c in df.columns if c != "model"]
-        if cols_to_merge:
-            base = base.merge(df[["model"] + cols_to_merge], on="model", how="left")
+        if not cols_to_merge:
             if verbose:
-                print(f"  ✓ {debug_name or f.name}: added {len(cols_to_merge)} columns")
-        elif verbose:
-            print(f"  - {debug_name or f.name}: no columns to merge")
+                print(f"  - {label}: no columns to merge")
+            continue
+        base = base.merge(df[["model"] + cols_to_merge], on="model", how="left")
+        if verbose:
+            print(f"  \u2713 {label}: added {len(cols_to_merge)} columns")
 
-    # Load all v* files (v1-v13) - no prefix
-    for i in range(1, 14):
-        merge_file([f"*.v{i}.gz", f"*.v{i}", f"*v{i}.gz", f"*v{i}"], debug_name=f"v{i}")
-
-    merge_file(["*.tc1.gz", "*.tc1", "*tc1.gz", "*tc1"])
-    merge_file(["*.tc2.gz", "*.tc2", "*tc2.gz", "*tc2"])
-
-    merge_file(["*.as.gz", "*.as"])
-
-    # Load surface abundances (s1-s4) with 's_' prefix
-    for i in range(1, 5):
-        merge_file([f"*.s{i}.gz", f"*.s{i}"], prefix="s_")
-
-    # Load central abundances (c1-c4) with 'c_' prefix
-    for i in range(1, 5):
-        merge_file([f"*.c{i}.gz", f"*.c{i}"], prefix="c_")
-
-    # Atomic mass numbers for abundance calculation A(X) = log10(X/H * A_H) + 12
-    # where A_H is the atomic mass of the element (e.g., 7 for Li7, 4 for He4, etc.)
 
     # Compute A(X) for surface abundances if s_H1 exists
     if "s_H1" in base.columns:
@@ -275,16 +286,13 @@ def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
 
         for element, atomic_mass in ATOMIC_MASSES.items():
             col_name = f"s_{element}"
-            if col_name in base.columns and element != "H1":  # Skip H1 itself
+            if col_name in base.columns and element != "H1":
                 X = pd.to_numeric(base[col_name], errors="coerce")
                 m = (X > 0) & (H1_surf > 0)
                 A_X = pd.Series(np.nan, index=base.index, dtype=float)
                 A_X[m] = np.log10(X[m] / (H1_surf[m] * atomic_mass)) + 12.0
                 base[f"A_{element}"] = A_X
 
-    # Compute pseudo A(heavy) if heavy mass fraction exists.
-    # NOTE: "heavy" is an aggregate of all elements heavier than Cl37, so there is no unique atomic mass.
-    # We use a representative atomic mass (56, iron-like) to get a consistent diagnostic quantity for plotting/debugging.
     if "s_heavy" in base.columns and "s_H1" in base.columns:
         H1_surf = pd.to_numeric(base["s_H1"], errors="coerce")
         Xh = pd.to_numeric(base["s_heavy"], errors="coerce")
@@ -299,14 +307,13 @@ def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
 
         for element, atomic_mass in ATOMIC_MASSES.items():
             col_name = f"c_{element}"
-            if col_name in base.columns and element != "H1":  # Skip H1 itself
+            if col_name in base.columns and element != "H1":
                 X = pd.to_numeric(base[col_name], errors="coerce")
                 m = (X > 0) & (H1_cent > 0)
                 A_X = pd.Series(np.nan, index=base.index, dtype=float)
                 A_X[m] = np.log10(X[m] / (H1_cent[m] * atomic_mass)) + 12.0
                 base[f"Ac_{element}"] = A_X
 
-        # Pseudo A(heavy) for central heavy mass fraction (see note above).
         if "c_heavy" in base.columns:
             Xh = pd.to_numeric(base["c_heavy"], errors="coerce")
             m = (Xh > 0) & (H1_cent > 0)
@@ -314,11 +321,9 @@ def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
             A_h[m] = np.log10(Xh[m] / (H1_cent[m] * 56.0)) + 12.0
             base["Ac_heavy"] = A_h
 
-    # Rename A_Li7 to A_Li for backward compatibility (and keep A_Li7 as well)
     if "A_Li7" in base.columns:
         base["A_Li"] = base["A_Li7"]
 
-    # Rename omega_S or omegas to Omega_surf for consistency
     if "omegas" in base.columns and "Omega_surf" not in base.columns:
         base = base.rename(columns={"omegas": "Omega_surf"})
     elif "omega_S" in base.columns and "Omega_surf" not in base.columns:
@@ -331,14 +336,130 @@ def load_one_model(model_dir: Path, verbose: bool = False) -> pd.DataFrame:
 
     return base
 
+def load_kipp_model(model_dir: Path, stem: Optional[str] = None) -> pd.DataFrame:
+    """Load only the files needed for the Kippenhahn diagram: .hr + .v3 + .v4 + .v5-.v8 + .v12.
 
-def load_hr_only(model_dir: Path) -> pd.DataFrame:
+    .v3/.v4 carry the mass-coordinate boundaries (and the conv1/env radii as
+    fractions of the stellar radius); .v12 carries the absolute radii (R_sun)
+    for the conv2-conv6 zones, needed for the radius-coordinate diagram.
+    .v5-.v8 carry the H/He/C/Ne nuclear-burning-zone boundaries (Xburn_Mb/Mt
+    in M_sun, Xburn_Rb/Rt as fractions of the stellar radius), drawn as
+    optional overlays controlled by cfg.kipp.show_*burn.
+
+    ~3-4s instead of ~29s for large models. KIPP_CACHE should be evicted once
+    FULL_CACHE is ready to avoid keeping a redundant copy in memory.
+    """
+    files = _collect_files(model_dir, stem)
+    if not files:
+        raise FileNotFoundError(f"No files in {model_dir}")
+
+    main_file = _pick_first(files, ["*.hr.gz", "*.hr", "*.track.gz", "*.track", "*.dat.gz", "*.dat", "*.csv"])
+    if not main_file:
+        main_file = sorted(files)[0]
+
+    base = _standardize_main(_read_any_table(main_file)).reset_index(drop=True)
+
+    for patterns, label in [
+        (["*.v3.gz", "*.v3", "*v3.gz", "*v3"], "v3"),
+        (["*.v4.gz", "*.v4", "*v4.gz", "*v4"], "v4"),
+        (["*.v5.gz", "*.v5", "*v5.gz", "*v5"], "v5"),
+        (["*.v6.gz", "*.v6", "*v6.gz", "*v6"], "v6"),
+        (["*.v7.gz", "*.v7", "*v7.gz", "*v7"], "v7"),
+        (["*.v8.gz", "*.v8", "*v8.gz", "*v8"], "v8"),
+        (["*.v12.gz", "*.v12", "*v12.gz", "*v12"], "v12"),
+    ]:
+        f = _pick_first(files, patterns)
+        if not f:
+            continue
+        try:
+            df = _read_any_table(f)
+        except Exception:
+            continue
+        if "model" not in df.columns:
+            continue
+        df.columns = [c.strip() for c in df.columns]
+        cols_to_merge = [c for c in df.columns if c != "model"]
+        if cols_to_merge:
+            base = base.merge(df[["model"] + cols_to_merge], on="model", how="left")
+
+    if "Age" in base.columns:
+        base = base.sort_values(["Age", "model"]).reset_index(drop=True)
+    elif "model" in base.columns:
+        base = base.sort_values("model").reset_index(drop=True)
+
+    return base
+
+
+def load_surf_model(model_dir: Path, stem: Optional[str] = None) -> pd.DataFrame:
+    """Load .hr + .s1-.s4 for surface abundance plots.
+
+    ~4-5s instead of ~29s for large models. Includes A(X) computation.
+    SURF_CACHE should be evicted once FULL_CACHE is ready.
+    """
+    files = _collect_files(model_dir, stem)
+    if not files:
+        raise FileNotFoundError(f"No files in {model_dir}")
+
+    main_file = _pick_first(files, ["*.hr.gz", "*.hr", "*.track.gz", "*.track", "*.dat.gz", "*.dat", "*.csv"])
+    if not main_file:
+        main_file = sorted(files)[0]
+
+    base = _standardize_main(_read_any_table(main_file)).reset_index(drop=True)
+
+    for i in range(1, 5):
+        f = _pick_first(files, [f"*.s{i}.gz", f"*.s{i}"])
+        if not f:
+            continue
+        try:
+            df = _read_any_table(f)
+        except Exception:
+            continue
+        if "model" not in df.columns:
+            continue
+        df.columns = [c.strip() for c in df.columns]
+        df = df.rename(columns={c: f"s_{c}" for c in df.columns if c != "model"})
+        cols_to_merge = [c for c in df.columns if c != "model"]
+        if cols_to_merge:
+            base = base.merge(df[["model"] + cols_to_merge], on="model", how="left")
+
+    # Compute A(X) surface abundances — same logic as load_one_model
+    if "s_H1" in base.columns:
+        H1_surf = pd.to_numeric(base["s_H1"], errors="coerce")
+        for element, atomic_mass in ATOMIC_MASSES.items():
+            col_name = f"s_{element}"
+            if col_name in base.columns and element != "H1":
+                X = pd.to_numeric(base[col_name], errors="coerce")
+                m = (X > 0) & (H1_surf > 0)
+                A_X = pd.Series(np.nan, index=base.index, dtype=float)
+                A_X[m] = np.log10(X[m] / (H1_surf[m] * atomic_mass)) + 12.0
+                base[f"A_{element}"] = A_X
+
+    if "s_heavy" in base.columns and "s_H1" in base.columns:
+        H1_surf = pd.to_numeric(base["s_H1"], errors="coerce")
+        Xh = pd.to_numeric(base["s_heavy"], errors="coerce")
+        m = (Xh > 0) & (H1_surf > 0)
+        A_h = pd.Series(np.nan, index=base.index, dtype=float)
+        A_h[m] = np.log10(Xh[m] / (H1_surf[m] * 56.0)) + 12.0
+        base["A_heavy"] = A_h
+
+    if "A_Li7" in base.columns:
+        base["A_Li"] = base["A_Li7"]
+
+    if "Age" in base.columns:
+        base = base.sort_values(["Age", "model"]).reset_index(drop=True)
+    elif "model" in base.columns:
+        base = base.sort_values("model").reset_index(drop=True)
+
+    return base
+
+
+def load_hr_only(model_dir: Path, stem: Optional[str] = None) -> pd.DataFrame:
     """Fast-path loader: read only the main *.hr file (or closest equivalent).
 
     Returns a standardized dataframe, but WITHOUT merging auxiliary files.
     Designed for quick HR-diagram rendering.
     """
-    files = _collect_files(model_dir)
+    files = _collect_files(model_dir, stem)
     if not files:
         raise FileNotFoundError(f"No files in {model_dir}")
 

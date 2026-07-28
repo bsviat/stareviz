@@ -77,6 +77,19 @@ _DEFAULTS: dict = {
         "show_thermo":      True,
         "thermo_fill":      "rgba(250,0,100,0.4)",   # reddish fill
         "thermo_line":      "rgba(255,0,30,0.6)",    # reddish border
+        # Nuclear burning zones (H/He/C/Ne) -- off by default, opt in via stareviz.yml
+        "show_Hburn":       False,
+        "Hburn_fill":       "rgba(255,140,0,0.35)",  # orange fill
+        "Hburn_line":       "rgba(230,110,0,0.6)",   # orange border
+        "show_Heburn":      False,
+        "Heburn_fill":      "rgba(255,215,0,0.35)",  # gold fill
+        "Heburn_line":      "rgba(200,160,0,0.6)",   # gold border
+        "show_Cburn":       False,
+        "Cburn_fill":       "rgba(0,180,255,0.35)",  # cyan fill
+        "Cburn_line":       "rgba(0,130,200,0.6)",   # cyan border
+        "show_Neburn":      False,
+        "Neburn_fill":      "rgba(160,80,255,0.35)", # purple fill
+        "Neburn_line":      "rgba(120,40,200,0.6)",  # purple border
         # Stipple rings (hatching inside convective zones)
         "rings":            "rgba(0,90,0,0.40)",
         "rings_size":       2,
@@ -169,6 +182,18 @@ class _KippColors:
         self.show_thermo: bool = bool(k.get("show_thermo", d["show_thermo"]))
         self.thermo_fill:    str   = str(k.get("thermo_fill",   d["thermo_fill"]))
         self.thermo_line:    str   = str(k.get("thermo_line",   d["thermo_line"]))
+        self.show_Hburn:  bool = bool(k.get("show_Hburn",  d["show_Hburn"]))
+        self.Hburn_fill:  str  = str(k.get("Hburn_fill",   d["Hburn_fill"]))
+        self.Hburn_line:  str  = str(k.get("Hburn_line",   d["Hburn_line"]))
+        self.show_Heburn: bool = bool(k.get("show_Heburn", d["show_Heburn"]))
+        self.Heburn_fill: str  = str(k.get("Heburn_fill",  d["Heburn_fill"]))
+        self.Heburn_line: str  = str(k.get("Heburn_line",  d["Heburn_line"]))
+        self.show_Cburn:  bool = bool(k.get("show_Cburn",  d["show_Cburn"]))
+        self.Cburn_fill:  str  = str(k.get("Cburn_fill",   d["Cburn_fill"]))
+        self.Cburn_line:  str  = str(k.get("Cburn_line",   d["Cburn_line"]))
+        self.show_Neburn: bool = bool(k.get("show_Neburn", d["show_Neburn"]))
+        self.Neburn_fill: str  = str(k.get("Neburn_fill",  d["Neburn_fill"]))
+        self.Neburn_line: str  = str(k.get("Neburn_line",  d["Neburn_line"]))
         self.rings:          str   = str(k.get("rings",         d["rings"]))
         self.rings_size:     int   = int(k.get("rings_size",   d["rings_size"]))
         self.rings_line_width: float = float(k.get("rings_line_width", d["rings_line_width"]))

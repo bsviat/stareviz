@@ -1,9 +1,29 @@
 from pathlib import Path
 from functools import lru_cache
+from typing import Optional
 import json
 import time
 import pandas as pd
 from stareviz.loader import load_one_model
+
+
+def _find_hr_stems(dir_path: Path) -> list[str]:
+    """Return sorted list of model stems found in dir_path via .hr/.hr.gz files."""
+    seen: set[str] = set()
+    for f in dir_path.glob("*.hr.gz"):
+        seen.add(f.name[: -len(".hr.gz")])
+    for f in dir_path.glob("*.hr"):
+        stem = f.name[: -len(".hr")]
+        seen.add(stem)
+    return sorted(seen)
+
+
+def parse_model_path(path: str) -> tuple[Path, Optional[str]]:
+    """Parse 'folder:::stem' or plain folder path → (folder, stem_or_None)."""
+    if ":::" in path:
+        folder, stem = path.split(":::", 1)
+        return Path(folder), stem
+    return Path(path), None
 
 # Path to the history file that tracks last-opened timestamps
 HISTORY_FILE = Path.home() / ".config" / "stareviz_history.json"
@@ -49,16 +69,35 @@ class ModelRegistry:
             for p in root.rglob("*"):
                 if not p.is_dir():
                     continue
-                if any(p.glob(pt) for pt in patterns):
+                if not any(p.glob(pt) for pt in patterns):
+                    continue
+                stems = _find_hr_stems(p)
+                if len(stems) > 1:
+                    ctime = _get_ctime(p)
+                    for stem in stems:
+                        rows.append({
+                            "name":        stem,
+                            "path":        str(p) + ":::" + stem,
+                            "folder_path": str(p),
+                            "folder_name": p.name,
+                            "stem":        stem,
+                            "created":     ctime,
+                        })
+                else:
+                    stem = stems[0] if stems else None
                     rows.append({
-                        "name":    p.name,
-                        "path":    str(p),
-                        "created": _get_ctime(p),
+                        "name":        stem if stem else p.name,
+                        "path":        (str(p) + ":::" + stem) if stem else str(p),
+                        "folder_path": str(p),
+                        "folder_name": p.name,
+                        "stem":        stem,
+                        "created":     _get_ctime(p),
                     })
 
-        self._index = (pd.DataFrame(rows)
-                       .drop_duplicates(subset=["path"])
-                       .reset_index(drop=True))
+        cols = ["name", "path", "folder_path", "folder_name", "stem", "created"]
+        self._index = (pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols))
+        if rows:
+            self._index = self._index.drop_duplicates(subset=["path"]).reset_index(drop=True)
 
         self._apply_sort()
         return self._index
@@ -89,9 +128,15 @@ class ModelRegistry:
                            .reset_index(drop=True))
 
         else:
-            # name sort
+            # name sort — keep multi-model groups contiguous:
+            # primary key = folder_name (same for all stems of one folder),
+            # secondary key = stem (within group) or '' (single-model items)
+            is_multi = self._index["stem"].notna()
+            self._index["_pk"] = self._index["folder_name"].where(is_multi, self._index["name"])
+            self._index["_sk"] = self._index["stem"].fillna("")
             self._index = (self._index
-                           .sort_values("name", ascending=asc)
+                           .sort_values(["_pk", "_sk"], ascending=[asc, True])
+                           .drop(columns=["_pk", "_sk"])
                            .reset_index(drop=True))
 
     def resort(self) -> None:
@@ -102,12 +147,16 @@ class ModelRegistry:
     def search(self, needle: str) -> pd.DataFrame:
         if self._index is None:
             self.build_index()
-        m = self._index["name"].str.contains(needle, case=False, regex=False)
+        m = (
+            self._index["name"].str.contains(needle, case=False, regex=False) |
+            self._index["folder_name"].str.contains(needle, case=False, regex=False)
+        )
         return self._index[m].copy()
 
     @lru_cache(maxsize=512)
     def load_model(self, path: str) -> pd.DataFrame:
-        return load_one_model(Path(path))
+        folder, stem = parse_model_path(path)
+        return load_one_model(folder, stem=stem)
 
 
 def _get_ctime(p: Path) -> float:

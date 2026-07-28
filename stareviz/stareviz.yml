@@ -93,13 +93,27 @@ kipp:
   show_thermo:  true    # true (default) - show; false - do not show
   thermo_fill:  "rgba(250,0,100,0.4)"  # reddish fill
   thermo_line:  "rgba(255,0,30,0.6)"   # reddish border
+  # Nuclear burning zones (H/He/C/Ne) -- each off by default, opt in below.
+  # *_fill/*_line follow the same "rgba(r,g,b,a)" format as the colours above.
+  show_Hburn:   true
+  Hburn_fill:   "rgba(100,60,255,0.25)"  # purple fill
+  Hburn_line:   "rgba(120,40,200,0.6)"   # purple border
+  show_Heburn:  false
+  Heburn_fill:  "rgba(255,215,0,0.3)"  # gold fill
+  Heburn_line:  "rgba(200,160,0,0.6)"   # gold border
+  show_Cburn:   false
+  Cburn_fill:   "rgba(0,180,255,0.3)"  # cyan fill
+  Cburn_line:   "rgba(0,130,200,0.6)"   # cyan border
+  show_Neburn:  false
+  Neburn_fill:  "rgba(255,140,0,0.3)" # orange fill 
+  Neburn_line:  "rgba(230,110,0,0.6)"  # orange border 
   # Boundary lines colours (base of envelope, stellar surface)
   boundary_line:    "rgba(0,90,0,0.70)"
   # Smooth phase transitions
   # transition_steps: number of gradient strips at each phase boundary (0 = sharp transition, no gradient)
   # transition_frac: fractional width (in age) of the transition zone
   # transition_frac_pms: fractional width for the PMS->MS transition specifically
-  transition_steps: 0      # 0 = sharp (default); >=2 smooth gradient (tip: better put values between 10 and <~20)
+  transition_steps: 20      # 0 = sharp (default); >=2 smooth gradient (tip: better put values between 10 and <~20)
   transition_frac: 0.01
   transition_frac_pms: 0.05
 
@@ -108,7 +122,7 @@ kipp:
 # ------------------------------------------------------------
 #  Freeze / snapshot overlay
 # ------------------------------------------------------------
-freeze_opacity: 0.5   # Opacity of the frozen background layer (0.0 = invisible, 1.0 = fully opaque)
+freeze_opacity: 0.6   # Opacity of the frozen background layer (0.0 = invisible, 1.0 = fully opaque)
 
 
 

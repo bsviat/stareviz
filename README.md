@@ -18,11 +18,13 @@ Built with [Dash](https://dash.plotly.com/) + [Plotly](https://plotly.com/python
 | **HR diagram & arbitrary 2D plots** | Any parameter on X/Y: Teff, L, logg, age, mass, rotation, abundances, … |
 | **Kippenhahn diagram** | Convective zones, thermohaline mixing, phase-coded radiative background |
 | **Isochrones** | Connect equal-age points across models; configurable sort order and styling |
-| **Freeze / snapshot overlay** | Freeze the current plot as a semi-transparent background, explore on top |
+| **Freeze / snapshot overlay** | Freeze the current plot as a semi-transparent background layer; stack multiple frozen layers |
 | **Evolutionary phase coloring** | Color tracks by phase (PMS / MS / SGB+RGB / HB / AGB) with phase range filter |
 | **Abundance formats** | X(X), A(X), [X/H], [X/M] — computed on the fly from mass fractions |
 | **Fast mode** | Load only `.hr` files for quick HR/Kiel diagram browsing of large grids |
 | **Multi-model loading** | Search and load any number of models; sidebar checklist with live search |
+| **Multi-model folders** | Folders with multiple model files are shown as collapsible groups in the sidebar |
+| **Per-model cache reload** | 🔄 button on hover reloads a single model from disk without restarting the app |
 | **Export to PNG** | Auto-named output files (e.g. `Li7surf_vs_Age_3_models.png`) |
 | **Fully configurable** | Colors, line widths, font sizes, grid, legend, isochrone style — all via `stareviz.yml` |
 
@@ -87,7 +89,9 @@ The interface is divided into two areas: a **control panel** on the top and a **
 ### Model management
 
 - **Search** — type any substring of a folder name (e.g. `"1.02"` for stellar mass) to find models; click to add
-- **Loaded models checklist** — check/uncheck models; each gets a unique color on the plot
+- **Loaded models checklist** — check/uncheck models; each gets a unique color on the plot; the box is vertically resizable
+- **Multi-model folders** — if a folder contains several model files, it appears as a collapsible group with a bold header (e.g. `▼ M1.16Z014227... [3]`); click the header to expand/collapse
+- **🔄 Reload** — hover over a model name to reveal a reload button; click it to clear that model's cache and re-read its files from disk without restarting
 - **Clear selection** — uncheck all models at once; unchecked models stay cached for instant re-selection
 - **Fast mode** — load only `.hr` files (HR/Kiel diagrams only, no abundances or Kippenhahn); useful for large grids
 
@@ -127,7 +131,7 @@ Two numeric inputs set a **phase range** — useful to isolate, e.g., only MS an
 
 ### Freeze plot
 
-Click **Freeze plot** to snapshot the current plot as a semi-transparent background layer. Then change axis parameters, models, or any other setting — the frozen layer stays visible for visual comparison. Click **Clear frozen** to remove it.
+Click **Freeze plot** to snapshot the current plot as a background layer. Then change axis parameters, models, or any other settings — the frozen layer stays visible for comparison. Press **Freeze plot** again to add another layer on top; repeat as many times as needed. Older layers fade progressively so the most recent one is always most visible. Click **Clear frozen** to remove all frozen layers except the most recent one; click again to clear the last remaining layer.
 
 ### Kippenhahn diagram
 
@@ -138,6 +142,9 @@ Select *Kippenhahn diagram* from the Y-axis dropdown (category *Basic*). The X-a
 | Background | Radiative zone, color-coded by phase (PMS = light blue, MS = yellow, SGB = orange, HB = salmon, AGB = pink) |
 | Green fill with rings | Convective zones (envelope + internal zones) |
 | Red/pink fill | Thermohaline mixing zone |
+| Colored fills (opt-in) | H / He / C / Ne burning zones — enable via `show_Hburn`, `show_Heburn`, `show_Cburn`, `show_Neburn` in `stareviz.yml` |
+
+The Y-axis can be switched between **mass coordinates** (M_r/M_total, default) and **radius coordinates** (R_r/R_total, linear or logarithmic) via the Y-axis scale options.
 
 > Kippenhahn view renders only the first selected model. Swap axes and X-axis dropdown are disabled in this mode.
 

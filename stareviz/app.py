@@ -1,5 +1,5 @@
 import dash
-from dash import Dash, dcc, html, Input, Output, State, callback_context
+from dash import Dash, dcc, html, Input, Output, State, callback_context, Patch, no_update, MATCH, ALL
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
@@ -26,8 +26,8 @@ from .utils import (
     get_effective_axis_scale,
 )
 
-from stareviz.registry import ModelRegistry, record_opened
-from stareviz.loader import load_hr_only
+from stareviz.registry import ModelRegistry, record_opened, parse_model_path
+from stareviz.loader import load_hr_only, load_kipp_model, load_surf_model
 
 import logging
 
@@ -242,6 +242,91 @@ def _abundance_axis_title(col: str, fmt: str) -> str:
     return fmt_labels.get(fmt, col)
 
 
+def _render_search_results(res: pd.DataFrame, currently_picked: list) -> list:
+    """Build grouped html structure for the search dropdown."""
+    picked_set = set(currently_picked or [])
+    children = []
+
+    # Maintain original sort order while grouping same-folder models together
+    seen_folders: list[str] = []
+    folder_rows: dict[str, list] = {}
+    for _, row in res.iterrows():
+        fp = row["folder_path"]
+        if fp not in folder_rows:
+            folder_rows[fp] = []
+            seen_folders.append(fp)
+        folder_rows[fp].append(row)
+
+    for fp in seen_folders:
+        rows = folder_rows[fp]
+        folder_name = rows[0]["folder_name"]
+        models = [(r["name"], r["path"]) for r in rows]
+
+        if len(models) == 1:
+            name, path = models[0]
+            children.append(
+                dcc.Checklist(
+                    id={"type": "search-group-cb", "index": fp},
+                    options=[{"label": name, "value": path}],
+                    value=[path] if path in picked_set else [],
+                    style={"fontSize": "16px"},
+                    labelStyle={"display": "flex", "alignItems": "center",
+                                "gap": "6px", "padding": "3px 0", "cursor": "pointer"},
+                    inputStyle={"margin": 0},
+                )
+            )
+        else:
+            group_values = [path for _, path in models if path in picked_set]
+            is_expanded = bool(group_values)
+            children.append(html.Div([
+                html.Div([
+                    html.Button(
+                        "▼" if is_expanded else "▶",
+                        id={"type": "group-toggle-btn", "index": fp},
+                        n_clicks=0,
+                        style={"background": "none", "border": "none", "cursor": "pointer",
+                               "padding": "0 3px", "fontSize": "11px", "color": "#555",
+                               "lineHeight": "1", "flexShrink": 0},
+                    ),
+                    html.Span(folder_name, style={
+                        "fontWeight": "600", "fontSize": "15px",
+                        "overflow": "hidden", "textOverflow": "ellipsis",
+                        "whiteSpace": "nowrap", "minWidth": 0,
+                    }),
+                    html.Span(f" [{len(models)}]", style={
+                        "color": "#999", "fontSize": "13px", "flexShrink": 0,
+                    }),
+                    html.Button(
+                        "Load all",
+                        id={"type": "load-all-btn", "index": fp},
+                        n_clicks=0,
+                        style={"marginLeft": "auto", "fontSize": "12px", "padding": "1px 8px",
+                               "cursor": "pointer", "border": "1px solid #ccc",
+                               "background": "#f5f5f5", "borderRadius": "4px",
+                               "flexShrink": 0},
+                    ),
+                ], style={"display": "flex", "alignItems": "center",
+                          "padding": "3px 0", "gap": "4px", "minWidth": 0}),
+                html.Div(
+                    id={"type": "group-body", "index": fp},
+                    style={"display": "block" if is_expanded else "none",
+                           "paddingLeft": "14px"},
+                    children=[
+                        dcc.Checklist(
+                            id={"type": "search-group-cb", "index": fp},
+                            options=[{"label": name, "value": path} for name, path in models],
+                            value=group_values,
+                            style={"fontSize": "15px"},
+                            labelStyle={"display": "flex", "alignItems": "center",
+                                        "gap": "6px", "padding": "2px 0", "cursor": "pointer"},
+                            inputStyle={"margin": 0},
+                        ),
+                    ],
+                ),
+            ]))
+    return children
+
+
 def build_server(roots: list[str], port: int = 8050):
     registry = ModelRegistry(roots)
     index_df = registry.build_index()
@@ -251,6 +336,16 @@ def build_server(roots: list[str], port: int = 8050):
     HR_CACHE: dict[str, pd.DataFrame] = {}
     FULL_CACHE: dict[str, pd.DataFrame] = {}
     FULL_FUTURES = {}  # path -> Future
+    KIPP_CACHE: dict[str, pd.DataFrame] = {}   # hr+v3+v4+v12 only; evicted when FULL_CACHE ready
+    KIPP_FUTURES = {}  # path -> Future; launched only when kipp mode is active
+    SURF_CACHE: dict[str, pd.DataFrame] = {}   # hr+s1-s4 only; evicted when FULL_CACHE ready
+    SURF_FUTURES = {}  # path -> Future; launched proactively alongside FULL
+
+    # Cache populated by every full render(): per-model cleaned/sorted interpolation
+    # data + the trace indices of the age-marker/isochrone traces in the current figure.
+    # Lets a slider-only move patch those traces in place via Patch() instead of
+    # rebuilding (and re-shipping to the browser) the entire figure.
+    AGE_MARKER_CACHE: dict = {}
 
     # --- helper: find category for parameter (for axis swap) ---
     param_to_category = {}
@@ -267,6 +362,195 @@ def build_server(roots: list[str], port: int = 8050):
         return AXIS_LABELS_PLOT.get(col, col)
 
     app = Dash(__name__, title="STAREVOL Visualizer", serve_locally=True, suppress_callback_exceptions=True)
+
+    _RELOAD_SCRIPT = r"""
+    <script>
+    (function () {
+        var _s = document.createElement('style');
+        _s.textContent = [
+            '.rl-btn { display: none; flex-shrink: 0;',
+            '  margin-left: 3px; padding: 0; font-size: 15px; line-height: 1;',
+            '  vertical-align: text-bottom; position: relative; top: 1px;',
+            '  cursor: pointer; background: none; border: none;',
+            '  white-space: nowrap; user-select: none; }',
+            '#picked-models label:hover .rl-btn { display: block; }',
+            '.grp-hdr { display: flex; align-items: center;',
+            '  gap: 4px; padding: 2px 0; cursor: pointer; min-width: 0;',
+            '  font-weight: 600; font-size: 18px; user-select: none; }',
+            '.grp-hdr-toggle { font-size: 12px; flex-shrink: 0; color: #555; }',
+            '.grp-hdr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+            '.grp-hdr-count { color: #999; font-size: 14px; flex-shrink: 0; font-weight: normal; }',
+            '.grp-spacer { visibility: hidden; pointer-events: none; }',
+            '#picked-models > label { display: flex !important; flex-direction: row !important;',
+            '  align-items: center !important; flex-wrap: nowrap !important; }',
+            '#picked-models > label.grp-hidden { display: none !important; }',
+            '#picked-models { grid-auto-flow: row dense; }'
+        ].join('\n');
+        (document.head || document.documentElement).appendChild(_s);
+
+        var _ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+
+        /* ── Inject 🔄 reload buttons ── */
+        function _inject() {
+            var c = document.getElementById('picked-models');
+            if (!c) return;
+            var cbs = c.querySelectorAll('input[type="checkbox"]');
+            if (!cbs.length) return;
+            cbs.forEach(function (cb) {
+                var item = cb.parentElement;
+                if (!item || item.dataset.rlInjected) return;
+                var span = item.querySelector('[data-model-path]');
+                if (!span) return;
+                var modelPath = span.getAttribute('data-model-path');
+                item.dataset.rlInjected = '1';
+                var b = document.createElement('span');
+                b.className = 'rl-btn';
+                b.textContent = '\u{1F504}';
+                b.title = 'Reload model';
+                b.setAttribute('data-rl-path', modelPath);
+                item.appendChild(b);
+            });
+        }
+
+        /* ── Inject group headers for multi-model folders ── */
+        var _grpCollapsed = {};   /* fp -> collapsed boolean, persists across rebuilds */
+        var _lastLabelNodes = []; /* label elements processed on the previous run */
+
+        function _injectGroups() {
+            var c = document.getElementById('picked-models');
+            if (!c) return;
+
+            var labels = Array.from(c.querySelectorAll('label'));
+            if (!labels.length) return;
+
+            /* Skip only if both the data-fp sequence AND the actual label
+               DOM nodes are unchanged. React sometimes replaces label nodes
+               wholesale (same data-fp values, new elements) when re-rendering
+               the checklist — in that case the new nodes won't carry our
+               grid placement, so we must rebuild even though the signature
+               string matches. */
+            var sig = labels.map(function(l){
+                var s = l.querySelector('[data-fp]');
+                return s ? s.getAttribute('data-fp') : '';
+            }).join('|');
+            var sameNodes = labels.length === _lastLabelNodes.length &&
+                labels.every(function(l, i){ return l === _lastLabelNodes[i]; });
+            if (c.dataset.grpSig === sig && sameNodes) return;
+            c.dataset.grpSig = sig;
+            _lastLabelNodes = labels;
+
+            /* Remove stale headers */
+            c.querySelectorAll('.grp-hdr').forEach(function(h){ h.remove(); });
+
+            /* Collect groups: fp → {folderName, labels, firstLabel} keeping order */
+            var fpOrder = [], groups = {};
+            labels.forEach(function(lbl) {
+                var span = lbl.querySelector('[data-fp]');
+                if (!span) return;
+                var fp = span.getAttribute('data-fp');
+                var fn = span.getAttribute('data-fn') || fp;
+                if (!groups[fp]) { groups[fp] = {fn: fn, labels: [], first: lbl}; fpOrder.push(fp); }
+                groups[fp].labels.push(lbl);
+            });
+
+            /* Simulate 2-column auto-flow to know which column each group
+               header will land in, so its items can be placed in the same
+               column. Every entry (single-model or group header) counts as
+               1 cell; col toggles between 0 (→col1) and 1 (→col2). */
+            var col = 0;
+            fpOrder.forEach(function(fp) {
+                groups[fp].headerCol = col + 1;   /* 1-based CSS column */
+                col = 1 - col;
+            });
+
+            fpOrder.forEach(function(fp) {
+                var g = groups[fp];
+                if (g.labels.length <= 1) return;   /* single-model folder: no header */
+
+                var hdr = document.createElement('div');
+                hdr.className = 'grp-hdr';
+                hdr.dataset.fp = fp;
+
+                var tog = document.createElement('span');
+                tog.className = 'grp-hdr-toggle';
+
+                var nm = document.createElement('span');
+                nm.className = 'grp-hdr-name';
+                nm.textContent = g.fn;
+
+                var cnt = document.createElement('span');
+                cnt.className = 'grp-hdr-count';
+                cnt.textContent = ' [' + g.labels.length + ']';
+
+                hdr.appendChild(tog); hdr.appendChild(nm); hdr.appendChild(cnt);
+
+                c.insertBefore(hdr, g.first);
+                /* Place group items in the same column as their header. */
+                g.labels.forEach(function(lbl) {
+                    lbl.style.gridColumn = String(g.headerCol);
+                    var sp = lbl.querySelector('[data-model-path]');
+                    if (sp) sp.style.fontSize = '15px';
+                });
+
+                /* Restore previous collapse state, defaulting to collapsed */
+                var collapsed = (fp in _grpCollapsed) ? _grpCollapsed[fp] : true;
+                _grpCollapsed[fp] = collapsed;
+                tog.textContent = collapsed ? '►' : '▼';
+                g.labels.forEach(function(lbl) { lbl.classList.toggle('grp-hidden', collapsed); });
+
+                hdr.addEventListener('click', function() {
+                    collapsed = !collapsed;
+                    _grpCollapsed[fp] = collapsed;
+                    tog.textContent = collapsed ? '►' : '▼';
+                    g.labels.forEach(function(lbl) {
+                        lbl.classList.toggle('grp-hidden', collapsed);
+                    });
+                });
+            });
+        }
+
+        document.addEventListener('click', function (e) {
+            var b = e.target.closest && e.target.closest('.rl-btn');
+            if (!b) return;
+            var modelPath = b.getAttribute('data-rl-path');
+            if (!modelPath) return;
+            e.preventDefault();
+            e.stopPropagation();
+            setTimeout(function () {
+                var inp = document.getElementById('reload-idx-input');
+                if (!inp) return;
+                _ns.call(inp, modelPath + ':' + Date.now());
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+            }, 0);
+        }, true);
+
+        function _run() { _inject(); _injectGroups(); }
+        new MutationObserver(_run).observe(document.documentElement, {childList: true, subtree: true});
+        _run();
+    })();
+    </script>
+    """
+
+    app.index_string = (
+        '<!DOCTYPE html>\n'
+        '<html>\n'
+        '    <head>\n'
+        '        {%metas%}\n'
+        '        <title>{%title%}</title>\n'
+        '        {%favicon%}\n'
+        '        {%css%}\n'
+        '    </head>\n'
+        '    <body>\n'
+        '        {%app_entry%}\n'
+        '        <footer>\n'
+        '            {%config%}\n'
+        '            {%scripts%}\n'
+        '            {%renderer%}\n'
+        '        </footer>\n'
+        + _RELOAD_SCRIPT +
+        '    </body>\n'
+        '</html>\n'
+    )
 
     # Close search dropdown when clicking outside the search wrapper
     app.clientside_callback(
@@ -340,25 +624,7 @@ def build_server(roots: list[str], port: int = 8050):
                                         "overflowY": "auto",
                                         "padding": "6px",
                                     },
-                                    children=[
-                                        dcc.Checklist(
-                                            id="search-picks",
-                                            options=[],
-                                            value=[],
-                                            style={"fontSize": "16px"},
-                                            labelStyle={
-                                                "display": "flex",
-                                                "alignItems": "center",
-                                                "gap": "6px",
-                                                "padding": "3px 0",
-                                                "cursor": "pointer",
-                                            },
-                                            inputStyle={"margin": 0},
-                                        ),
-                                        html.Div(id="search-no-results", style={"display": "none",
-                                                                                "color": "#b00", "fontSize": "16px",
-                                                                                "padding": "4px"}),
-                                    ],
+                                    children=[],
                                 ),
                             ],
                         ),
@@ -412,10 +678,11 @@ def build_server(roots: list[str], port: int = 8050):
 
                         html.Div(
                             style={
-                                "maxHeight": "95px",
+                                "height": "95px",
                                 "overflowY": "auto",
                                 "border": "1px solid #ddd",
                                 "padding": "6px",
+                                "resize": "vertical",
                             },
                             children=[
                                 dcc.Checklist(
@@ -432,14 +699,25 @@ def build_server(roots: list[str], port: int = 8050):
                                                     "whiteSpace": "nowrap",
                                                     "minWidth": 0,
                                                 },
+                                                **{
+                                                    "data-fp":   fp,
+                                                    "data-fn":   fn,
+                                                    "data-model-path": p,
+                                                },
                                             ),
                                             "value": p,
                                         }
-                                        for n, p in zip(index_df["name"], index_df["path"])
+                                        for n, p, fp, fn in zip(
+                                            index_df["name"],
+                                            index_df["path"],
+                                            index_df["folder_path"],
+                                            index_df["folder_name"],
+                                        )
                                     ],
                                     style={
                                         "display": "grid",
                                         "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
+                                        "gridAutoFlow": "row dense",
                                         "gap": "6px",
                                         "fontSize": "18px",
                                         "lineHeight": "1.1",
@@ -572,7 +850,7 @@ def build_server(roots: list[str], port: int = 8050):
                              ]),
 
                              # Swap axes
-                             html.Div(style={"paddingTop": "20px"}, children=[
+                             html.Div(style={"paddingTop": "22px"}, children=[
                                  html.Button("⇄", id="swap-axes", style={
                                      "fontSize": "15px", "padding": "6px 10px", "cursor": "pointer",
                                      "border": "1px solid #ccc", "background": "#f5f5f5", "borderRadius": "4px"
@@ -611,6 +889,17 @@ def build_server(roots: list[str], port: int = 8050):
                                  ]),
                                  # Y axis format selectors
                                  html.Div(style={"paddingTop": "22px", "width": "80px", "flexShrink": "0"}, children=[
+                                     html.Div(id="y-kipp-coord-container", style={"display": "none"}, children=[
+                                         dcc.RadioItems(
+                                             id="y-kipp-coord",
+                                             options=[
+                                                 {"label": "M", "value": "M"},
+                                                 {"label": "R", "value": "R"},
+                                             ],
+                                             value="M",
+                                             style={"fontSize": "14px"}
+                                         )
+                                     ]),
                                      html.Div(id="y-age-units-container", style={"display": "none"}, children=[
                                          dcc.RadioItems(
                                              id="y-age-units",
@@ -737,6 +1026,9 @@ def build_server(roots: list[str], port: int = 8050):
             # Plot window
             dcc.Interval(id="poll-full-load", interval=1000, n_intervals=0, disabled=True),
             dcc.Store(id="frozen-images", data=[]),
+            dcc.Store(id="frozen-composite", data=None),
+            dcc.Store(id="reload-signal", data=None),
+            dcc.Input(id="reload-idx-input", type="text", value="", debounce=False, style={"display": "none"}),
             dcc.Graph(
                 id="plot",
                 style={"height": "75vh", "paddingTop": "5px"},
@@ -760,7 +1052,7 @@ def build_server(roots: list[str], port: int = 8050):
     # Freeze button: clientside callback returns a Promise — Dash 2.x awaits it automatically
     app.clientside_callback(
         """
-        function(n_clicks, existing, ycol, xAgeUnits) {
+        function(n_clicks, ycol, xAgeUnits) {
             var NO_UPDATE = window.dash_clientside.no_update;
             if (!n_clicks) return [NO_UPDATE, NO_UPDATE];
 
@@ -786,7 +1078,9 @@ def build_server(roots: list[str], port: int = 8050):
             // Serialize the SVG to a string, inline all styles
             var svgClone = mainSvg.cloneNode(true);
             svgClone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-            // Ensure explicit background
+            // Remove previously frozen overlays (layout.images) so they don't get baked into this snapshot
+            svgClone.querySelectorAll('image').forEach(function(el) { el.remove(); });
+            // Add white background so SVG renders correctly
             var bgRect = document.createElementNS('http://www.w3.org/2000/svg','rect');
             bgRect.setAttribute('width', w); bgRect.setAttribute('height', h);
             bgRect.setAttribute('fill', 'white');
@@ -808,11 +1102,12 @@ def build_server(roots: list[str], port: int = 8050):
                     URL.revokeObjectURL(url);
                     var cropped = canvas.toDataURL('image/png');
                     console.log('[FREEZE] cropped length=', cropped.length);
-                    var imgs = existing ? existing.slice() : [];
+                    // Use window-level accumulator to avoid Dash State staleness in async callbacks
+                    if (!window._frozenImgs) window._frozenImgs = [];
                     var isKipp = !!(ycol && ycol.startsWith('__kipp'));
-                    imgs.push({src: cropped, w: cropW, h: cropH, is_kipp: isKipp, x_age_units: xAgeUnits || 'gyr'});
+                    window._frozenImgs.push({src: cropped, w: cropW, h: cropH, is_kipp: isKipp, x_age_units: xAgeUnits || 'gyr'});
                     // If freezing kipp: force same age units on the overlay
-                    resolve([imgs, isKipp ? xAgeUnits : NO_UPDATE]);
+                    resolve([window._frozenImgs.slice(), isKipp ? xAgeUnits : NO_UPDATE]);
                 };
                 img.onerror = function(e) {
                     console.log('[FREEZE] error loading svg:', e);
@@ -826,7 +1121,6 @@ def build_server(roots: list[str], port: int = 8050):
         Output("frozen-images", "data", allow_duplicate=True),
         Output("x-age-units", "value", allow_duplicate=True),
         Input("btn-freeze", "n_clicks"),
-        State("frozen-images", "data"),
         State("ycol", "value"),
         State("x-age-units", "value"),
         prevent_initial_call=True,
@@ -842,12 +1136,70 @@ def build_server(roots: list[str], port: int = 8050):
     def clear_frozen(n_clicks):
         return [], "Frozen layers cleared."
 
+    # Composite all frozen PNGs into one image (JS-side, no Python image libs needed).
+    # Each older frozen layer is dimmed by one extra power of freeze_opacity: the most
+    # recently frozen layer gets freeze_opacity^1, the one before it freeze_opacity^2,
+    # etc., so that re-freezing compounds the fade exactly as the user expects.
+    _freeze_opacity_js = repr(max(0.0, min(1.0, float(cfg.freeze_opacity))))
+    app.clientside_callback(
+        """
+        function(frozen_images) {
+            if (!frozen_images || frozen_images.length === 0) return null;
+            var n = frozen_images.length;
+            var W = frozen_images[0].w, H = frozen_images[0].h;
+            var canvas = document.createElement('canvas');
+            canvas.width = W; canvas.height = H;
+            var ctx = canvas.getContext('2d');
+            var freezeOpacity = """ + _freeze_opacity_js + """;
+            return new Promise(function(resolve) {
+                var pending = n;
+                var imgEls = new Array(n);
+                frozen_images.forEach(function(entry, i) {
+                    var img = new Image();
+                    img.onload = function() {
+                        imgEls[i] = img;
+                        if (--pending === 0) {
+                            imgEls.forEach(function(imgEl, idx) {
+                                // Draw to temp canvas to strip white background
+                                var tmp = document.createElement('canvas');
+                                tmp.width = W; tmp.height = H;
+                                var tc = tmp.getContext('2d');
+                                tc.drawImage(imgEl, 0, 0, W, H);
+                                var id = tc.getImageData(0, 0, W, H), d = id.data;
+                                for (var j = 0; j < d.length; j += 4) {
+                                    if (d[j] > 240 && d[j+1] > 240 && d[j+2] > 240) d[j+3] = 0;
+                                }
+                                tc.putImageData(id, 0, 0);
+                                // idx counts from oldest (0) to newest (n-1) frozen layer;
+                                // the newest frozen layer is one step behind the live plot,
+                                // so it gets freezeOpacity^1, the previous one ^2, and so on.
+                                ctx.globalAlpha = Math.pow(freezeOpacity, n - idx);
+                                ctx.drawImage(tmp, 0, 0);
+                            });
+                            ctx.globalAlpha = 1.0;
+                            resolve(canvas.toDataURL('image/png'));
+                        }
+                    };
+                    img.onerror = function() { if (--pending === 0) resolve(canvas.toDataURL('image/png')); };
+                    img.src = entry.src;
+                });
+            });
+        }
+        """,
+        Output("frozen-composite", "data"),
+        Input("frozen-images", "data"),
+        prevent_initial_call=True,
+    )
+
     # Status label update whenever store changes
     app.clientside_callback(
         """
         function(imgs) {
-            if (!imgs || imgs.length === 0) return '';
-            return 'Background layer frozen.';
+            if (!imgs || imgs.length === 0) {
+                window._frozenImgs = [];
+                return '';
+            }
+            return imgs.length === 1 ? '1 layer frozen.' : imgs.length + ' layers frozen.';
         }
         """,
         Output("frozen-status", "children", allow_duplicate=True),
@@ -895,25 +1247,21 @@ def build_server(roots: list[str], port: int = 8050):
     )
 
     @app.callback(
-        Output("search-picks", "options"),
-        Output("search-picks", "value"),
+        Output("search-dropdown", "children"),
         Output("search-dropdown", "style"),
-        Output("search-no-results", "children"),
-        Output("search-no-results", "style"),
         Input("search", "value"),
         State("picked-models", "value"),
     )
     def do_search(q, currently_picked):
         if not q:
-            return [], [], _DROPDOWN_HIDDEN, "", {"display": "none"}
+            return [], _DROPDOWN_HIDDEN
         res = registry.search(q)
         if res.empty:
-            return [], [], _DROPDOWN_VISIBLE, "No matches", {"display": "block", "color": "#b00", "fontSize": "16px",
-                                                             "padding": "4px"}
-        opts = [{"label": n, "value": p} for n, p in zip(res["name"], res["path"])]
-        currently_picked = currently_picked or []
-        pre_checked = [o["value"] for o in opts if o["value"] in currently_picked]
-        return opts, pre_checked, _DROPDOWN_VISIBLE, "", {"display": "none"}
+            return (
+                [html.Div("No matches", style={"color": "#b00", "fontSize": "16px", "padding": "4px"})],
+                _DROPDOWN_VISIBLE,
+            )
+        return _render_search_results(res, currently_picked or []), _DROPDOWN_VISIBLE
 
     # Update X parameter options when category changes
     @app.callback(
@@ -983,8 +1331,17 @@ def build_server(roots: list[str], port: int = 8050):
         Input("ycol", "value"),
         Input("xcol", "value"),
         Input("y-abund-format", "value"),
+        Input("y-kipp-coord", "value"),
     )
-    def sync_yscale(ycol, xcol, y_abund_fmt):
+    def sync_yscale(ycol, xcol, y_abund_fmt, kipp_coord):
+        if str(ycol or "") == "__kipp_env":
+            if str(kipp_coord or "M") == "R":
+                # Radius-coordinate Kippenhahn: Lin/Log are both meaningful, Log(X) is not
+                opts = [{**o, "disabled": o["value"] == "log(x)"} for o in AXIS_SCALE_CHOICES]
+                return opts, "lin"
+            # Mass-coordinate Kippenhahn — lin only
+            opts = [{**o, "disabled": o["value"] != "lin"} for o in AXIS_SCALE_CHOICES]
+            return opts, "lin"
         if str(xcol or "").startswith("__kipp"):
             opts = [{**o, "disabled": o["value"] != "lin"} for o in AXIS_SCALE_CHOICES]
             return opts, "lin"
@@ -1043,50 +1400,73 @@ def build_server(roots: list[str], port: int = 8050):
 
     @app.callback(
         Output("picked-models", "value"),
-        Input("search-picks", "value"),
         Input("btn-clear-models", "n_clicks"),
-        State("picked-models", "value"),
-        State("search-picks", "options"),
         prevent_initial_call=True,
     )
-    def merge_picks(search_vals, clear_clicks, current, search_opts):
-        ctx = callback_context
-        if not ctx.triggered:
-            return current or []
-
-        trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
-
-        if trigger_id == "btn-clear-models":
-            return []
-
-        if trigger_id == "search-picks":
-            search_vals = search_vals or []
-            all_search_paths = [o["value"] for o in (search_opts or [])]
-            current_set = set(current or [])
-            current_set -= (set(all_search_paths) - set(search_vals))
-            current_set |= set(search_vals)
-            return sorted(current_set)
-
-        return current or []
+    def clear_models(_):
+        return []
 
     @app.callback(
-        Output("search-picks", "value", allow_duplicate=True),
-        Input("picked-models", "value"),
-        State("search-picks", "options"),
+        Output("picked-models", "value", allow_duplicate=True),
+        Input({"type": "search-group-cb", "index": ALL}, "value"),
+        State("picked-models", "value"),
+        State({"type": "search-group-cb", "index": ALL}, "options"),
         prevent_initial_call=True,
     )
-    def sync_search_checkboxes(picked, search_opts):
-        picked = picked or []
-        if not search_opts:
-            return []
-        return [o["value"] for o in search_opts if o["value"] in picked]
+    def merge_picks(all_cb_values, current, all_cb_opts):
+        if not callback_context.triggered:
+            return current or []
+        all_visible: set[str] = set()
+        for opts in (all_cb_opts or []):
+            for o in (opts or []):
+                all_visible.add(o["value"])
+        newly_selected: set[str] = set()
+        for vals in (all_cb_values or []):
+            newly_selected.update(vals or [])
+        current_set = set(current or [])
+        current_set -= (all_visible - newly_selected)
+        current_set |= newly_selected
+        return sorted(current_set)
+
+    @app.callback(
+        Output({"type": "group-body", "index": MATCH}, "style"),
+        Output({"type": "group-toggle-btn", "index": MATCH}, "children"),
+        Input({"type": "group-toggle-btn", "index": MATCH}, "n_clicks"),
+        State({"type": "group-body", "index": MATCH}, "style"),
+        prevent_initial_call=True,
+    )
+    def toggle_group(_, current_style):
+        is_hidden = (current_style or {}).get("display") == "none"
+        if is_hidden:
+            return {"display": "block", "paddingLeft": "14px"}, "▼"
+        return {"display": "none"}, "▶"
+
+    @app.callback(
+        Output("picked-models", "value", allow_duplicate=True),
+        Input({"type": "load-all-btn", "index": ALL}, "n_clicks"),
+        State("picked-models", "value"),
+        prevent_initial_call=True,
+    )
+    def load_all_from_group(n_clicks_list, current):
+        triggered = [t for t in callback_context.triggered
+                     if t.get("value") and t["value"] > 0]
+        if not triggered:
+            return current or []
+        import json as _json
+        folder_path = _json.loads(triggered[0]["prop_id"].split(".")[0])["index"]
+        folder_df = registry._index[registry._index["folder_path"] == folder_path]
+        current_set = set(current or [])
+        current_set |= set(folder_df["path"].tolist())
+        return sorted(current_set)
 
     @app.callback(
         Output("age-slider", "value"),
-        Input("age-input", "value"),
+        Input("age-input", "n_submit"),
+        Input("age-input", "n_blur"),
+        State("age-input", "value"),
         prevent_initial_call=True
     )
-    def sync_age_input_to_slider(input_val):
+    def sync_age_input_to_slider(n_submit, n_blur, input_val):
         # Input changed (in Myr) -> convert to years for slider
         slider_value = input_val * 1e6 if input_val is not None else 0
         return slider_value
@@ -1166,6 +1546,17 @@ def build_server(roots: list[str], port: int = 8050):
             return {"display": "block"}
         else:
             return {"display": "none"}
+
+    # Callback to show/hide the Kippenhahn M/R coordinate-type selector
+    # (only the Y axis can host a Kippenhahn diagram — see auto_set_x_for_kipp).
+    @app.callback(
+        Output("y-kipp-coord-container", "style"),
+        Input("ycol", "value"),
+    )
+    def toggle_y_kipp_coord(ycol):
+        if str(ycol or "") == "__kipp_env":
+            return {"display": "block"}
+        return {"display": "none"}
 
     # --- Abundance format callbacks ---
 
@@ -1284,6 +1675,31 @@ def build_server(roots: list[str], port: int = 8050):
             return tickvals, ticktext
 
     @app.callback(
+        Output("reload-signal", "data"),
+        Input("reload-idx-input", "value"),
+        prevent_initial_call=True,
+    )
+    def reload_model_cache(value):
+        import time
+        if not value:
+            return dash.no_update
+        try:
+            path = value.rsplit(":", 1)[0]
+        except (ValueError, AttributeError):
+            return dash.no_update
+        if not path:
+            return dash.no_update
+        HR_CACHE.pop(path, None)
+        FULL_CACHE.pop(path, None)
+        FULL_FUTURES.pop(path, None)
+        KIPP_CACHE.pop(path, None)
+        KIPP_FUTURES.pop(path, None)
+        SURF_CACHE.pop(path, None)
+        SURF_FUTURES.pop(path, None)
+        AGE_MARKER_CACHE.clear()
+        return time.time()
+
+    @app.callback(
         Output("plot", "figure"),
         Output("load-status", "children"),
         Output("poll-full-load", "disabled"),
@@ -1295,6 +1711,7 @@ def build_server(roots: list[str], port: int = 8050):
         Input("ycol", "value"),
         Input("xscale", "value"),
         Input("yscale", "value"),
+        Input("y-kipp-coord", "value"),
         Input("x-age-units", "value"),
         Input("y-age-units", "value"),
         Input("show-phase", "value"),
@@ -1307,18 +1724,31 @@ def build_server(roots: list[str], port: int = 8050):
         Input("fast-hr-mode", "value"),
         Input("x-abund-format", "value"),
         Input("y-abund-format", "value"),
+        Input("reload-signal", "data"),
         State("frozen-images", "data"),
+        Input("frozen-composite", "data"),
     )
-    def render(models, xcol, ycol, xscale, yscale, x_age_units, y_age_units, show_phase_value, phase_min_in,
+    def render(models, xcol, ycol, xscale, yscale, kipp_coord, x_age_units, y_age_units, show_phase_value, phase_min_in,
                phase_max_in,
                selected_age, show_isochrone_value, _poll, relayout, fast_hr_mode, x_abund_fmt, y_abund_fmt,
-               frozen_images):
+               reload_signal, frozen_images, frozen_composite):
 
         # Set default values if None (happens on initial load)
         if xcol is None:
             xcol = "Teff"
         if ycol is None:
             ycol = "L"
+
+        # Discard stale zoom/pan state (relayoutData reflects the LAST relayout
+        # event on the plot, regardless of what triggered this render) whenever
+        # the user changes WHAT is being plotted rather than interacting with
+        # the plot itself -- otherwise e.g. switching Kippenhahn M<->R or
+        # toggling its Y-scale would reapply the previous diagram's zoomed
+        # range to the new one. uirevision below mirrors this so the client
+        # doesn't try to restore the old view either.
+        _trigger_id = callback_context.triggered_id if callback_context.triggered else None
+        if _trigger_id in ("xcol", "ycol", "xscale", "yscale", "y-kipp-coord", "picked-models"):
+            relayout = None
 
         def _get_zoom_range(relayout, axis: str):
             if not relayout or not isinstance(relayout, dict):
@@ -1375,10 +1805,18 @@ def build_server(roots: list[str], port: int = 8050):
         xcol = xcol or "Teff"
         ycol = ycol or "L"
         kipp_env_mode = (str(ycol) == "__kipp_env")
+        # The dropdown offers a single "Kippenhahn diagram" entry; the M/R radio
+        # button next to it (default "M") picks the mass- or radius-coordinate
+        # variant -- see y-kipp-coord-container in the layout and sync_yscale.
+        kipp_radius_mode = (kipp_env_mode and str(kipp_coord or "M") == "R")
 
         # Effective scale modes (forced modes override user selection)
         xscale_eff = get_effective_axis_scale(xcol, xscale)
         yscale_eff = get_effective_axis_scale(ycol, yscale)
+        if kipp_env_mode and not kipp_radius_mode:
+            # Mass-coordinate Kippenhahn is lin-only (sync_yscale already locks
+            # the radio to "lin", but force it here too in case of stale state).
+            yscale_eff = "lin"
 
         def _wrap_title_with_log10(title: str) -> str:
             """Wrap an axis title into log10(...), preserving LaTeX $...$ when present."""
@@ -1669,6 +2107,269 @@ def build_server(roots: list[str], port: int = 8050):
 
             return marker_x, marker_y, extras
 
+        def _compute_age_marker_position(marker_data, selected_age,
+                                          xscale_eff, yscale_eff,
+                                          x_age_factor, y_age_factor,
+                                          x_scale, y_scale):
+            """
+            Compute (marker_x, marker_y, is_at_max_age) for the age-tracker dot
+            of one model at the given age, or (None, None, False) when it
+            shouldn't be shown (age out of range / not enough data).
+
+            Pure function of (marker_data, selected_age, axis settings) — used both
+            for the full figure rebuild and for the fast Patch()-only update path,
+            so the two stay perfectly in sync. Caches the cleaned/sorted interpolation
+            frame on `marker_data` itself (keyed '_interp_df') so repeated calls across
+            slider ticks skip the dropna/sort/reset_index work.
+            """
+            if selected_age <= 0:
+                return None, None, False
+
+            x_plot = marker_data['x_plot']
+            y_plot = marker_data['y_plot']
+            age_array = marker_data['age_array']
+            x_is_age_flag = marker_data['x_is_age']
+            y_is_age_flag = marker_data['y_is_age']
+
+            if age_array.isna().all():
+                return None, None, False
+
+            max_age_for_model = age_array.max()
+            is_at_max_age = False
+
+            def _age_to_axis(age_val, scale, factor):
+                if scale == 'lin':
+                    return age_val * factor / 1e6
+                elif scale == 'log(x)':
+                    return np.log10(age_val) if age_val > 0 else None
+                else:
+                    return age_val
+
+            if selected_age >= max_age_for_model - 1.0:
+                last_idx = age_array.last_valid_index()
+                if pd.isna(last_idx):
+                    return None, None, False
+
+                if x_is_age_flag:
+                    marker_x = _age_to_axis(max_age_for_model, xscale_eff, x_age_factor)
+                else:
+                    marker_x = x_plot.iloc[x_plot.index.get_loc(last_idx)]
+
+                if y_is_age_flag:
+                    marker_y = _age_to_axis(max_age_for_model, yscale_eff, y_age_factor)
+                else:
+                    marker_y = y_plot.iloc[y_plot.index.get_loc(last_idx)]
+
+                is_at_max_age = True
+            else:
+                interp_df = marker_data.get('_interp_df')
+                if interp_df is None:
+                    interp_df = pd.DataFrame({
+                        'age': age_array, 'x': x_plot, 'y': y_plot
+                    }).dropna().sort_values('age').reset_index(drop=True)
+                    marker_data['_interp_df'] = interp_df
+
+                if len(interp_df) < 2:
+                    return None, None, False
+                if selected_age < interp_df['age'].iloc[0] or selected_age > interp_df['age'].iloc[-1]:
+                    return None, None, False
+
+                result = _interp_age_marker(
+                    interp_df, selected_age,
+                    x_is_age_flag, y_is_age_flag,
+                    xscale_eff, yscale_eff,
+                    x_age_factor, y_age_factor,
+                )
+                if result is None:
+                    return None, None, False
+                marker_x, marker_y, _ = result
+
+            if not (pd.notna(marker_x) and pd.notna(marker_y)):
+                return None, None, False
+
+            if x_scale is not None and not x_is_age_flag:
+                marker_x = marker_x / x_scale
+            if y_scale is not None and not y_is_age_flag:
+                marker_y = marker_y / y_scale
+
+            return marker_x, marker_y, is_at_max_age
+
+        def _compute_isochrone_point(marker_data, selected_age,
+                                      xscale_eff, yscale_eff,
+                                      x_age_factor, y_age_factor,
+                                      x_scale, y_scale):
+            """
+            Compute (marker_x, marker_y, marker_logg, iso_sort_val) for one model's
+            contribution to the isochrone overlay at the given age, or None when
+            the model has no usable point at this age.
+
+            Mirrors _compute_age_marker_position's caching/sharing strategy so the
+            isochrone overlay can also be refreshed via the fast Patch()-only path.
+            """
+            if selected_age <= 0:
+                return None
+
+            x_plot = marker_data['x_plot']
+            y_plot = marker_data['y_plot']
+            age_array = marker_data['age_array']
+            logg_array = marker_data.get('logg_array')
+            iso_sort_array = marker_data.get('iso_sort_array')
+            x_is_age_flag = marker_data['x_is_age']
+            y_is_age_flag = marker_data['y_is_age']
+
+            if age_array.isna().all():
+                return None
+
+            max_age_for_model = age_array.max()
+            marker_x = marker_y = marker_logg = None
+            iso_sort_val = None
+
+            def _age_to_axis(age_val, scale, factor):
+                if scale == 'lin':
+                    return age_val * factor / 1e6
+                elif scale == 'log(x)':
+                    return np.log10(age_val) if age_val > 0 else None
+                else:
+                    return age_val
+
+            if selected_age >= max_age_for_model * 0.999:
+                last_idx = age_array.idxmax()
+
+                if x_is_age_flag:
+                    marker_x = _age_to_axis(max_age_for_model, xscale_eff, x_age_factor)
+                else:
+                    marker_x = x_plot.iloc[x_plot.index.get_loc(last_idx)]
+
+                if y_is_age_flag:
+                    marker_y = _age_to_axis(max_age_for_model, yscale_eff, y_age_factor)
+                else:
+                    marker_y = y_plot.iloc[y_plot.index.get_loc(last_idx)]
+
+                if logg_array is not None:
+                    marker_logg = logg_array.iloc[logg_array.index.get_loc(last_idx)]
+                if iso_sort_array is not None:
+                    iso_sort_val = iso_sort_array.iloc[iso_sort_array.index.get_loc(last_idx)]
+            else:
+                interp_df = marker_data.get('_iso_interp_df')
+                extra_cols = marker_data.get('_iso_extra_cols')
+                if interp_df is None:
+                    extra_cols = []
+                    df_kwargs = {'age': age_array, 'x': x_plot, 'y': y_plot}
+                    dropna_subset = ['age', 'x', 'y']
+
+                    if logg_array is not None:
+                        df_kwargs['logg'] = logg_array
+                        extra_cols.append('logg')
+                    if iso_sort_array is not None:
+                        df_kwargs['iso_sort'] = iso_sort_array
+                        if logg_array is None:
+                            df_kwargs['logg'] = iso_sort_array
+                            if 'logg' not in extra_cols:
+                                extra_cols.append('logg')
+                        extra_cols.append('iso_sort')
+
+                    interp_df = (pd.DataFrame(df_kwargs)
+                                 .dropna(subset=dropna_subset)
+                                 .sort_values('age')
+                                 .reset_index(drop=True))
+                    marker_data['_iso_interp_df'] = interp_df
+                    marker_data['_iso_extra_cols'] = extra_cols
+
+                if len(interp_df) < 2:
+                    return None
+                if selected_age < interp_df['age'].iloc[0] or selected_age > interp_df['age'].iloc[-1]:
+                    return None
+
+                result = _interp_age_marker(
+                    interp_df, selected_age,
+                    x_is_age_flag, y_is_age_flag,
+                    xscale_eff, yscale_eff,
+                    x_age_factor, y_age_factor,
+                    extra_cols=extra_cols,
+                )
+                if result is None:
+                    return None
+                marker_x, marker_y, extras = result
+
+                if 'logg' in extras:
+                    marker_logg = extras['logg']
+                if 'iso_sort' in extras:
+                    iso_sort_val = float(extras['iso_sort'])
+
+            if not (pd.notna(marker_x) and pd.notna(marker_y)):
+                return None
+
+            if x_scale is not None and not x_is_age_flag:
+                marker_x = marker_x / x_scale
+            if y_scale is not None and not y_is_age_flag:
+                marker_y = marker_y / y_scale
+
+            if iso_sort_val is None:
+                iso_sort_val = marker_logg
+
+            return marker_x, marker_y, marker_logg, iso_sort_val
+
+        # --- Fast path: the age slider (or the linked age-input box) is the ONLY
+        # thing that changed. Instead of rebuilding the whole figure (re-loading
+        # dataframes, redrawing every track/phase trace, re-shipping everything to
+        # the browser) just to move one small dot, patch the existing age-marker
+        # and isochrone traces in place via Patch(). The cache is populated by every
+        # full render below and mirrors exactly the trace layout it just produced,
+        # so trace indices stay valid as long as nothing else has changed — which is
+        # guaranteed here since every other Input would itself trigger a full render.
+        # (Placed after the two helpers above so it can call them directly.) ---
+        ctx = callback_context
+        trigger_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
+        if trigger_id == "age-slider" and AGE_MARKER_CACHE:
+            cache = AGE_MARKER_CACHE
+            patched = Patch()
+
+            if not cache['kipp_env_mode']:
+                for i, marker_data in enumerate(cache['age_markers_data']):
+                    mx, my, is_max = _compute_age_marker_position(
+                        marker_data, selected_age,
+                        cache['xscale_eff'], cache['yscale_eff'],
+                        cache['x_age_factor'], cache['y_age_factor'],
+                        cache['x_scale'], cache['y_scale'],
+                    )
+                    idx = cache['marker_start_idx'] + i
+                    patched['data'][idx]['x'] = [mx] if mx is not None else []
+                    patched['data'][idx]['y'] = [my] if my is not None else []
+                    patched['data'][idx]['marker']['symbol'] = 'square' if is_max else 'circle'
+
+            if cache['isochrone_idx'] is not None:
+                points = []
+                for marker_data in cache['age_markers_data']:
+                    point = _compute_isochrone_point(
+                        marker_data, selected_age,
+                        cache['xscale_eff'], cache['yscale_eff'],
+                        cache['x_age_factor'], cache['y_age_factor'],
+                        cache['x_scale'], cache['y_scale'],
+                    )
+                    if point is not None:
+                        points.append(point)
+
+                iso_x, iso_y = [], []
+                if len(points) >= 2:
+                    asc = cfg.isochrone_sort_ascending
+                    if all(p[3] is not None and pd.notna(p[3]) for p in points):
+                        points.sort(key=lambda p: p[3], reverse=(not asc))
+                    else:
+                        points.sort(key=lambda p: p[0], reverse=(not asc))
+                    iso_x = [p[0] for p in points]
+                    iso_y = [p[1] for p in points]
+
+                idx = cache['isochrone_idx']
+                patched['data'][idx]['x'] = iso_x
+                patched['data'][idx]['y'] = iso_y
+
+            corrected_age_input = selected_age / 1e6
+            if selected_age > cache['max_age_among_models']:
+                corrected_age_input = cache['max_age_among_models'] / 1e6
+
+            return (patched, no_update, no_update,
+                    no_update, no_update, corrected_age_input)
+
         def _axis_scale_factor(vmin, vmax):
             """
             Power-of-10 scale factor (e.g. 1e-5) for matplotlib-like offset '×10^k'.
@@ -1781,26 +2482,176 @@ def build_server(roots: list[str], port: int = 8050):
                 if bg: fig.update_layout(images=bg)
             return fig, "", True, 1e7, {0: '0', 2.5e6: '2.5', 5e6: '5.0', 7.5e6: '7.5', 1e7: '10.0'}, 0
 
+        def _track_conv_zones(zones_data):
+            """
+            STAREVOL doesn't keep a stable identity for its numbered convective
+            zones: which slot (conv2, conv3, ...) describes a given physical
+            layer can hand off from one saved timestep to the next -- most
+            visibly during marginal/borderline ("flickering") instability near
+            the surface on the giant branch, where two very close, thin
+            sub-layers swap conv2/conv3 labels every few timesteps (sometimes
+            even merging into one reported interval and splitting again).
+            Drawing "conv2's polygon" and "conv3's polygon" verbatim then means
+            each polygon zigzags between the two physical layers' positions, so
+            their translucent fills (identical colour/opacity) cross and stack
+            into a visibly darker, jagged "duplicated zone" -- not a real
+            second zone.
+
+            Re-derive stable tracks by greedily matching each row's active
+            interval(s) to whichever previously-seen interval they sit closest
+            to (merging same-row overlaps first), instead of trusting
+            STAREVOL's hand-off-prone raw label. A track that finds no match in
+            a row is retired immediately -- so a genuinely new/relocated layer
+            never gets stitched onto an unrelated old one (it simply starts a
+            fresh, separate segment in the first free output slot, exactly like
+            today's "zone with two disjoint lifetimes" case) -- while a layer
+            that reappears a few rows later naturally re-attaches to its own
+            recent position. This keeps each output slot following one physical
+            layer smoothly, so coincident/overlapping/handed-off zones render
+            as correctly separated (or correctly merged, when STAREVOL itself
+            reports them merged) fills. Everything downstream (fills, rings,
+            contours, hover) keeps consuming conv_zones_data exactly as before.
+            """
+            if len(zones_data) <= 1:
+                return zones_data
+
+            raw = [(mt.to_numpy(dtype=float), mb.to_numpy(dtype=float)) for _, mt, mb in zones_data]
+            n_rows = raw[0][0].size
+            n_slots = len(raw)
+            out_mt = [np.zeros(n_rows) for _ in range(n_slots)]
+            out_mb = [np.zeros(n_rows) for _ in range(n_slots)]
+            track_lo = [None] * n_slots
+            track_hi = [None] * n_slots
+
+            for r in range(n_rows):
+                intervals = []
+                for mt_arr, mb_arr in raw:
+                    mt_v = mt_arr[r]
+                    mb_v = mb_arr[r]
+                    if mt_v != 0.0 or mb_v != 0.0:
+                        lo, hi = (mb_v, mt_v) if mb_v <= mt_v else (mt_v, mb_v)
+                        intervals.append([lo, hi])
+
+                if not intervals:
+                    track_lo = [None] * n_slots
+                    track_hi = [None] * n_slots
+                    continue
+
+                intervals.sort()
+                merged = []
+                for lo, hi in intervals:
+                    if merged and lo <= merged[-1][1]:
+                        if hi > merged[-1][1]:
+                            merged[-1][1] = hi
+                    else:
+                        merged.append([lo, hi])
+
+                # Greedily pair each (track, candidate-interval) by closeness,
+                # globally smallest distance first, so the clearest matches win
+                # before any ambiguous ones are forced into a decision.
+                used_tracks, used_intervals = set(), set()
+                candidates = []
+                for ti in range(n_slots):
+                    if track_lo[ti] is None:
+                        continue
+                    for ii, (lo, hi) in enumerate(merged):
+                        dist = abs(lo - track_lo[ti]) + abs(hi - track_hi[ti])
+                        candidates.append((dist, ti, ii))
+                candidates.sort(key=lambda c: c[0])
+                for _dist, ti, ii in candidates:
+                    if ti in used_tracks or ii in used_intervals:
+                        continue
+                    used_tracks.add(ti)
+                    used_intervals.add(ii)
+                    lo, hi = merged[ii]
+                    out_mb[ti][r] = lo
+                    out_mt[ti][r] = hi
+                    track_lo[ti], track_hi[ti] = lo, hi
+
+                # Unmatched intervals are new/relocated layers -- start a fresh
+                # track in the first free slot.
+                for ii, (lo, hi) in enumerate(merged):
+                    if ii in used_intervals:
+                        continue
+                    free = next((ti for ti in range(n_slots)
+                                 if track_lo[ti] is None and ti not in used_tracks), None)
+                    if free is None:
+                        continue  # impossible: at most n_slots intervals can coexist
+                    out_mb[free][r] = lo
+                    out_mt[free][r] = hi
+                    track_lo[free], track_hi[free] = lo, hi
+                    used_tracks.add(free)
+
+                # Tracks with no match this row go quiet -- retiring them
+                # immediately (rather than keeping them "warm") guarantees a
+                # visible gap separates any two genuinely different episodes
+                # that later reuse the same output slot.
+                for ti in range(n_slots):
+                    if ti not in used_tracks:
+                        track_lo[ti] = None
+                        track_hi[ti] = None
+
+            index = zones_data[0][1].index
+            return [
+                (i + 1, pd.Series(out_mt[i], index=index), pd.Series(out_mb[i], index=index))
+                for i in range(n_slots)
+            ]
+
+        # Radius-mode + log Y: tracks the smallest/largest positive boundary
+        # value across ALL overlaid models, so the y-axis range (computed once,
+        # after the loop, from these globals -- see kipp_radius_mode branch
+        # near "Y-axis" below) covers every model's data, not just the last one.
+        kipp_y_floor_global = None
+        kipp_y_max_global = None
+
         for i, path in enumerate(models or []):
             # Check if fast HR mode is enabled
             use_fast_mode = "fast" in (fast_hr_mode or [])
 
-            # 0) If full load finished since last poll — promote to FULL_CACHE
+            is_kipp_mode = (str(ycol) == "__kipp_env")
+            kipp_radius_mode = (is_kipp_mode and str(kipp_coord or "M") == "R")
+            # Radius-mode + log Y: y=0 (stellar centre, R=0 / m_base=0) is -Infinity
+            # in log space. Plotly then renders any "toself" polygon edge that touches
+            # such a point as a spurious diagonal fold instead of a clean fill down to
+            # the plot's bottom -- see _floor_y_log below for the fix.
+            y_log_mode = bool(kipp_radius_mode and yscale_eff == "log")
+
+            # 0) If full load finished — promote to FULL_CACHE, evict intermediate caches
             fut = FULL_FUTURES.get(path)
             if fut is not None and fut.done():
                 try:
                     FULL_CACHE[path] = fut.result()
+                    KIPP_CACHE.pop(path, None)   # redundant once full data is available
+                    SURF_CACHE.pop(path, None)   # redundant once full data is available
                 except Exception:
-                    # keep HR-only if full load failed
                     pass
                 FULL_FUTURES.pop(path, None)
 
+            # 0b) If kipp load finished — promote to KIPP_CACHE
+            kfut = KIPP_FUTURES.get(path)
+            if kfut is not None and kfut.done():
+                try:
+                    KIPP_CACHE[path] = kfut.result()
+                except Exception:
+                    pass
+                KIPP_FUTURES.pop(path, None)
+
+            # 0c) If surf load finished — promote to SURF_CACHE
+            sfut = SURF_FUTURES.get(path)
+            if sfut is not None and sfut.done():
+                try:
+                    SURF_CACHE[path] = sfut.result()
+                except Exception:
+                    pass
+                SURF_FUTURES.pop(path, None)
+
             # 1) Choose dataframe to plot now
+            _model_folder, _model_stem = parse_model_path(path)
             if use_fast_mode:
                 # Fast HR mode: only load .hr files, never kick off full load
                 if path not in HR_CACHE:
                     try:
-                        HR_CACHE[path] = load_hr_only(Path(path))
+                        HR_CACHE[path] = load_hr_only(_model_folder, stem=_model_stem)
                     except Exception:
                         continue
                 df = HR_CACHE[path].copy()
@@ -1809,15 +2660,19 @@ def build_server(roots: list[str], port: int = 8050):
                 df = FULL_CACHE[path].copy()
                 loaded += 1
             else:
-                # Full mode: HR-only fast path with background full load
+                # Full mode: start with HR, upgrade to SURF if ready
                 if path not in HR_CACHE:
                     try:
-                        HR_CACHE[path] = load_hr_only(Path(path))
+                        HR_CACHE[path] = load_hr_only(_model_folder, stem=_model_stem)
                     except Exception:
                         continue
-                df = HR_CACHE[path].copy()
 
-                # 2) Kick off background full load (only once)
+                if path in SURF_CACHE:
+                    df = SURF_CACHE[path].copy()
+                else:
+                    df = HR_CACHE[path].copy()
+
+                # Kick off background full load (only once)
                 if path not in FULL_FUTURES:
                     try:
                         FULL_FUTURES[path] = executor.submit(registry.load_model, path)
@@ -1827,9 +2682,28 @@ def build_server(roots: list[str], port: int = 8050):
                     if not FULL_FUTURES[path].done():
                         loading += 1
 
+                # Kick off surf load proactively (only once)
+                if path not in SURF_FUTURES:
+                    try:
+                        SURF_FUTURES[path] = executor.submit(
+                            load_surf_model, _model_folder, _model_stem)
+                    except Exception:
+                        pass
+
+                # Kipp mode: upgrade df to KIPP_CACHE if available, else launch kipp load
+                if is_kipp_mode:
+                    if path in KIPP_CACHE:
+                        df = KIPP_CACHE[path].copy()
+                    elif path not in KIPP_FUTURES:
+                        try:
+                            KIPP_FUTURES[path] = executor.submit(
+                                load_kipp_model, _model_folder, _model_stem)
+                        except Exception:
+                            pass
+
             abund_ratio_arr = ["MH", "alphaH_ONeMgSiS", "alphaH_MgSi", "alphaM_ONeMgSiS", "alphaM_MgSi",
                                "Li6_Li7", "C12_C13", "C12_N14", "N14_N15", "O16_O17", "O16_O18"]
-            if str(ycol) != "__kipp_env":
+            if not is_kipp_mode:
                 missing_x = (xcol and (xcol not in df.columns) and (
                         xcol not in abund_ratio_arr) and not _is_abund_col(xcol))
                 missing_y = (ycol and (ycol not in df.columns) and (
@@ -1838,8 +2712,11 @@ def build_server(roots: list[str], port: int = 8050):
                 if missing_x or missing_y:
                     continue
             else:
-                # Kippenhahn needs full-load columns (envelope base mass + total mass)
-                required_cols = {"Age", "env_Mb", "M"}
+                # Kippenhahn needs hr+v3+v4(+v12) columns (from KIPP_CACHE or FULL_CACHE)
+                if kipp_radius_mode:
+                    required_cols = {"Age", "env_Rb", "R"}
+                else:
+                    required_cols = {"Age", "env_Mb", "M"}
                 if not required_cols.issubset(set(df.columns)):
                     continue
 
@@ -1849,30 +2726,55 @@ def build_server(roots: list[str], port: int = 8050):
                 df["L"] = 10 ** pd.to_numeric(df["logL"], errors="coerce")
 
             # --- Special plot: Kippenhahn diagram (convective envelope only) ---
-            if str(ycol) == "__kipp_env":
+            if is_kipp_mode:
                 # Age is stored in Myr in STAREVOL outputs -> convert to selected units
                 age_raw = pd.to_numeric(df["Age"], errors="coerce")
                 age_max = float(np.nanmax(age_raw.to_numpy())) if age_raw.notna().any() else np.nan
                 age_gyr = age_raw * x_age_factor
 
-                m_tot = pd.to_numeric(df["M"], errors="coerce")
-                m_base = pd.to_numeric(df["env_Mb"], errors="coerce")
+                if kipp_radius_mode:
+                    # Radius coordinate: R is the absolute total radius (R_sun, from .hr).
+                    # env_Rb/conv1_Rb/conv1_Rt (from .v3) are normalized fractions (R/R*) —
+                    # convert to absolute R_sun by multiplying by R. conv2-6_Rb/Rt (from
+                    # .v12) are already absolute R_sun.
+                    m_tot = pd.to_numeric(df["R"], errors="coerce")
+                    m_base = pd.to_numeric(df["env_Rb"], errors="coerce") * m_tot
 
-                conv_zones_data = []
-                for i in range(1, 6):
-                    mt_col = f"conv{i}_Mt"
-                    mb_col = f"conv{i}_Mb"
-                    if mt_col in df.columns and mb_col in df.columns:
-                        mt_vals = df[mt_col].to_numpy()
-                        mb_vals = df[mb_col].to_numpy()
-                        if np.any(mt_vals != 0) or np.any(mb_vals != 0):
-                            conv_zones_data.append((i, pd.to_numeric(df[mt_col], errors="coerce"),
-                                                    pd.to_numeric(df[mb_col], errors="coerce")))
+                    conv_zones_data = []
+                    for i in range(1, 6):
+                        mt_col = f"conv{i}_Rt"
+                        mb_col = f"conv{i}_Rb"
+                        if mt_col in df.columns and mb_col in df.columns:
+                            mt_vals = pd.to_numeric(df[mt_col], errors="coerce")
+                            mb_vals = pd.to_numeric(df[mb_col], errors="coerce")
+                            if i == 1:
+                                # .v3 values are normalized fractions (R/R*)
+                                mt_vals = mt_vals * m_tot
+                                mb_vals = mb_vals * m_tot
+                            if np.any(mt_vals.to_numpy() != 0) or np.any(mb_vals.to_numpy() != 0):
+                                conv_zones_data.append((i, mt_vals, mb_vals))
+                else:
+                    m_tot = pd.to_numeric(df["M"], errors="coerce")
+                    m_base = pd.to_numeric(df["env_Mb"], errors="coerce")
+
+                    conv_zones_data = []
+                    for i in range(1, 6):
+                        mt_col = f"conv{i}_Mt"
+                        mb_col = f"conv{i}_Mb"
+                        if mt_col in df.columns and mb_col in df.columns:
+                            mt_vals = df[mt_col].to_numpy()
+                            mb_vals = df[mb_col].to_numpy()
+                            if np.any(mt_vals != 0) or np.any(mb_vals != 0):
+                                conv_zones_data.append((i, pd.to_numeric(df[mt_col], errors="coerce"),
+                                                        pd.to_numeric(df[mb_col], errors="coerce")))
+
+                conv_zones_data = _track_conv_zones(conv_zones_data)
 
                 valid_env = age_gyr.notna() & m_tot.notna() & m_base.notna() & (m_base > 0) & (m_base < m_tot)
                 if not valid_env.any():
+                    missing_label = "env_Rb" if kipp_radius_mode else "env_Mb"
                     fig.add_annotation(
-                        text=f"{Path(path).name}: no convective envelope (env_Mb missing or invalid)",
+                        text=f"{Path(path).name}: no convective envelope ({missing_label} missing or invalid)",
                         xref="paper", yref="paper", x=0.01, y=0.98, showarrow=False, align="left"
                     )
                     continue
@@ -1885,12 +2787,116 @@ def build_server(roots: list[str], port: int = 8050):
                 else:
                     ph = None
 
-                # Thermohaline mixing zone (conv6_* in *.v4): draw as semi-transparent reddish area
+                # Thermohaline mixing zone (conv6_* in *.v4/*.v12): draw as semi-transparent reddish area
                 therm_mt = None
                 therm_mb = None
-                if cfg.kipp.show_thermo and "conv6_Mt" in df.columns and "conv6_Mb" in df.columns:
-                    therm_mt = pd.to_numeric(df["conv6_Mt"], errors="coerce")
-                    therm_mb = pd.to_numeric(df["conv6_Mb"], errors="coerce")
+                if cfg.kipp.show_thermo:
+                    if kipp_radius_mode:
+                        if "conv6_Rt" in df.columns and "conv6_Rb" in df.columns:
+                            therm_mt = pd.to_numeric(df["conv6_Rt"], errors="coerce")
+                            therm_mb = pd.to_numeric(df["conv6_Rb"], errors="coerce")
+                    else:
+                        if "conv6_Mt" in df.columns and "conv6_Mb" in df.columns:
+                            therm_mt = pd.to_numeric(df["conv6_Mt"], errors="coerce")
+                            therm_mb = pd.to_numeric(df["conv6_Mb"], errors="coerce")
+
+                # Nuclear burning zones (H/He/C/Ne, from *.v5-*.v8): same idea as the
+                # thermohaline zone above -- a translucent fill spanning [Xburn_*b, Xburn_*t],
+                # drawn wherever the zone is active (Xburn_*t != 0). Each element is
+                # independently toggled and coloured via cfg.kipp.show_*burn / *burn_fill / *burn_line.
+                burn_zones_data = []
+                for _elem, _show, _fill, _line in (
+                    ("H",  cfg.kipp.show_Hburn,  cfg.kipp.Hburn_fill,  cfg.kipp.Hburn_line),
+                    ("He", cfg.kipp.show_Heburn, cfg.kipp.Heburn_fill, cfg.kipp.Heburn_line),
+                    ("C",  cfg.kipp.show_Cburn,  cfg.kipp.Cburn_fill,  cfg.kipp.Cburn_line),
+                    ("Ne", cfg.kipp.show_Neburn, cfg.kipp.Neburn_fill, cfg.kipp.Neburn_line),
+                ):
+                    if not _show:
+                        continue
+                    if kipp_radius_mode:
+                        _mt_col, _mb_col = f"{_elem}burn_Rt", f"{_elem}burn_Rb"
+                    else:
+                        _mt_col, _mb_col = f"{_elem}burn_Mt", f"{_elem}burn_Mb"
+                    if _mt_col not in df.columns or _mb_col not in df.columns:
+                        continue
+                    _mt_vals = pd.to_numeric(df[_mt_col], errors="coerce")
+                    _mb_vals = pd.to_numeric(df[_mb_col], errors="coerce")
+                    if kipp_radius_mode:
+                        # *burn_Rb/*burn_Rt are normalized fractions (R/R*) -- convert to absolute R_sun
+                        _mt_vals = _mt_vals * m_tot
+                        _mb_vals = _mb_vals * m_tot
+                    if np.any(_mt_vals.to_numpy(dtype=float) != 0.0):
+                        burn_zones_data.append((_mt_vals, _mb_vals, _fill, _line))
+
+                # In radius mode with a log Y-axis, the stellar centre (R=0 / m_base=0)
+                # is -Infinity in log space. "toself" polygon fills (convective zones,
+                # radiative-stage masks, the envelope fill) legitimately reach down to
+                # that centre, and Plotly renders any such edge as a spurious diagonal
+                # fold instead of a clean fill to the bottom of the plot (reproduced in
+                # isolation: a "toself" trace with y=0 vertices on a log axis always
+                # draws this fold, regardless of zoom). Replacing those y<=0 vertices
+                # with the smallest *positive* value that already occurs in this
+                # model's own boundary data sidesteps the rendering quirk without
+                # perturbing autorange -- that value was already going to be the
+                # axis's effective minimum, so substituting it for y<=0 introduces no
+                # new extreme and the fill simply clips flush with the plot's bottom.
+                y_floor = None
+                y_data_max = None
+                if y_log_mode:
+                    _floor_candidates = []
+                    for _ser in (m_tot, m_base, therm_mt, therm_mb):
+                        if _ser is not None:
+                            _arr = _ser.to_numpy(dtype=float)
+                            _pos = _arr[np.isfinite(_arr) & (_arr > 0)]
+                            if _pos.size:
+                                _floor_candidates.append(float(_pos.min()))
+                    for _, _mt_ser, _mb_ser in conv_zones_data:
+                        for _ser in (_mt_ser, _mb_ser):
+                            _arr = _ser.to_numpy(dtype=float)
+                            _pos = _arr[np.isfinite(_arr) & (_arr > 0)]
+                            if _pos.size:
+                                _floor_candidates.append(float(_pos.min()))
+                    for _mt_ser, _mb_ser, _, _ in burn_zones_data:
+                        for _ser in (_mt_ser, _mb_ser):
+                            _arr = _ser.to_numpy(dtype=float)
+                            _pos = _arr[np.isfinite(_arr) & (_arr > 0)]
+                            if _pos.size:
+                                _floor_candidates.append(float(_pos.min()))
+                    if _floor_candidates:
+                        y_floor = min(_floor_candidates)
+                        kipp_y_floor_global = (y_floor if kipp_y_floor_global is None
+                                               else min(kipp_y_floor_global, y_floor))
+
+                    _y_max = float(np.nanmax(m_tot.to_numpy()))
+                    if np.isfinite(_y_max):
+                        y_data_max = _y_max
+                        kipp_y_max_global = (_y_max if kipp_y_max_global is None
+                                             else max(kipp_y_max_global, _y_max))
+
+                def _floor_y_log(arr):
+                    """Clamp non-positive/invalid y-vertices to y_floor when on a log
+                    radius axis, so "toself" polygon fills never carry a y<=0 vertex
+                    (see y_floor comment above for why this is safe for autorange)."""
+                    if not y_log_mode or y_floor is None:
+                        return arr
+                    arr = np.asarray(arr, dtype=float)
+                    return np.where(np.isfinite(arr) & (arr > 0), arr, y_floor)
+
+                def _interp_boundary(x_query, x_data, y_data):
+                    """Interpolate a zone boundary onto the rings grid the SAME way
+                    Plotly draws the line between those exact two data points: on a
+                    linear y-axis that's a straight line in (x, y); on a log y-axis
+                    the renderer is linear in (x, log10(y)) screen space, so raw-y
+                    interpolation would bow the rings' inclusion band away from the
+                    actual rendered fill/contour edge. The mismatch is invisible when
+                    consecutive samples have similar y, but glaring across a "grows
+                    from zero" edge, where y spans orders of magnitude in one step --
+                    rings would then cover a visibly different sliver than the fill.
+                    Floor non-positive values first so log10 never sees zero (mirrors
+                    how the fill polygon itself floors that same vertex)."""
+                    if y_log_mode:
+                        return 10.0 ** np.interp(x_query, x_data, np.log10(_floor_y_log(y_data)))
+                    return np.interp(x_query, x_data, y_data)
 
                 # Fill the convective envelope region between m_base and m_tot (segment-wise to avoid gaps)
                 v = valid_env.to_numpy()
@@ -1899,20 +2905,58 @@ def build_server(roots: list[str], port: int = 8050):
                 chunks = np.split(idxs, cuts)
 
                 dash = dash_styles[i % 6]
-                model_name = Path(path).name
+                _folder, _stem = parse_model_path(path)
+                model_name = _stem if _stem else _folder.name
                 if cfg.legend_max_chars is not None:
                     model_name = model_name[:cfg.legend_max_chars]
 
+                prev_chunk_end = -1
                 for ch in chunks:
                     if ch.size < 2:
                         continue
+
+                    # Extended index range used ONLY for per-zone (conv_zones_data)
+                    # drawing: absorbs any "this zone is active but env_Mb isn't
+                    # valid yet" stretch immediately preceding this chunk -- e.g.
+                    # an early fully-convective phase described solely by conv1
+                    # (env_Mb == 0, excluded by valid_env's m_base > 0 test) before
+                    # a radiative core forms and env_Mb becomes meaningfully
+                    # positive. Those rows fall in the gap before chunks[0] (or
+                    # between chunks) and would otherwise never be visited by any
+                    # conv_zones_data sub-loop below, leaving that zone's
+                    # fill/rings/contour entirely undrawn -- a "white hole" where
+                    # the star genuinely was convective. Consecutive chunks' own
+                    # ch_zones never overlap.
+                    ch_zones = np.arange(prev_chunk_end + 1, int(ch[-1]) + 1)
+                    prev_chunk_end = int(ch[-1])
+
+                    # Whether some conv_zones_data zone already covers the gap
+                    # right before this chunk (only possible for chunks[0], since
+                    # that's the only place such a gap was found in practice) --
+                    # if so, the main envelope fill/boundary lines below must NOT
+                    # invent their own (age=0, mb=0) taper there: that would
+                    # double-paint on top of the zone's own fill (drawn via
+                    # ch_zones, further down).
+                    lead_gap_covered = False
+                    if (ch is chunks[0]) and (ch[0] > 0):
+                        _lead = np.arange(0, int(ch[0]))
+                        for _zn, _mts, _mbs in conv_zones_data:
+                            _mt_l = _mts.iloc[_lead].to_numpy(dtype=float)
+                            _mb_l = _mbs.iloc[_lead].to_numpy(dtype=float)
+                            if np.any((_mt_l != 0.0) | (_mb_l != 0.0)):
+                                lead_gap_covered = True
+                                break
 
                     x_seg = age_gyr.iloc[ch].to_numpy()
                     mb_seg = m_base.iloc[ch].to_numpy()
                     mt_seg = m_tot.iloc[ch].to_numpy()
 
                     # Add initial point at x=0 if data doesn't start exactly at 0
-                    if (ch is chunks[0]) and (x_seg.size > 0):
+                    # -- but only when no conv_zones_data zone already covers that
+                    # lead-in gap (see lead_gap_covered above); otherwise this
+                    # taper would draw a bogus diagonal on top of that zone's own
+                    # (correct) fill and double-paint the overlap.
+                    if (ch is chunks[0]) and (x_seg.size > 0) and not lead_gap_covered:
                         first_x = float(x_seg[0])
                         if abs(first_x) > 1e-10:  # Not exactly zero
                             x_seg = np.concatenate([[0.0], x_seg])
@@ -1925,7 +2969,7 @@ def build_server(roots: list[str], port: int = 8050):
 
                     fig.add_trace(go.Scatter(
                         x=x_poly,
-                        y=y_poly,
+                        y=_floor_y_log(y_poly),
                         mode="lines",
                         name=model_name,
                         legendgroup=model_name,
@@ -1937,11 +2981,50 @@ def build_server(roots: list[str], port: int = 8050):
                     ))
 
                     for zone_num, mt_series, mb_series in conv_zones_data:
-                        mt_zone = mt_series.iloc[ch].to_numpy(dtype=float)
-                        mb_zone = mb_series.iloc[ch].to_numpy(dtype=float)
-                        x_zone = age_gyr.iloc[ch].to_numpy(dtype=float)
+                        mt_zone = mt_series.iloc[ch_zones].to_numpy(dtype=float)
+                        mb_zone = mb_series.iloc[ch_zones].to_numpy(dtype=float)
+                        x_zone = age_gyr.iloc[ch_zones].to_numpy(dtype=float)
+                        # Envelope bounds at the same rows, used below to drop
+                        # samples where this numbered zone is just a spurious
+                        # duplicate of (part of) the envelope -- see "nested"
+                        # comment near `present`.
+                        env_mb_zone = m_base.iloc[ch_zones].to_numpy(dtype=float)
+                        env_mt_zone = m_tot.iloc[ch_zones].to_numpy(dtype=float)
+                        # Parallel array of absolute dataframe row indices, so we
+                        # can still recognise "the row right before chunks[0]"
+                        # after the x=0 prepend below shifts everything by one
+                        # (-1 marks the artificial prepended point, which can
+                        # never equal a real row index).
+                        abs_idx = ch_zones.copy()
+
+                        # Extend to the plot's left edge exactly like the main
+                        # envelope fill does for chunks[0] above -- otherwise a
+                        # zone that is active right from the start of the data
+                        # would leave a sliver gap between x=0 and its first
+                        # real sample.
+                        if (ch_zones[0] == 0) and (x_zone.size > 0) and (abs(float(x_zone[0])) > 1e-10):
+                            x_zone = np.concatenate([[0.0], x_zone])
+                            mt_zone = np.concatenate([[float(mt_zone[0])], mt_zone])
+                            mb_zone = np.concatenate([[float(mb_zone[0])], mb_zone])
+                            env_mb_zone = np.concatenate([[float(env_mb_zone[0])], env_mb_zone])
+                            env_mt_zone = np.concatenate([[float(env_mt_zone[0])], env_mt_zone])
+                            abs_idx = np.concatenate([[-1], abs_idx])
 
                         present = (mt_zone != 0.0) | (mb_zone != 0.0)
+                        # Some STAREVOL timesteps report a numbered zone (e.g.
+                        # conv2) whose entire interval sits inside the
+                        # envelope's interval -- the same convective region
+                        # described twice, rendered as a spurious nested wedge
+                        # on top of the envelope fill. Drop those samples: a
+                        # zone is a duplicate-of-envelope sample when its base
+                        # is at or above the envelope's base AND its top is at
+                        # or below the envelope's top (>= / <= so that the edge
+                        # case where the zone's base coincides exactly with the
+                        # envelope's base is also excluded -- otherwise a
+                        # zero-thickness zone still renders as a bare contour
+                        # line on top of the envelope boundary).
+                        nested_in_env = (env_mb_zone > 0) & (mb_zone >= env_mb_zone) & (mt_zone <= env_mt_zone)
+                        present = present & ~nested_in_env
                         if not np.any(present):
                             continue
 
@@ -1965,12 +3048,66 @@ def build_server(roots: list[str], port: int = 8050):
                                 mt_part = np.concatenate([[0.0], mt_part])
                                 mb_part = np.concatenate([[0.0], mb_part])
 
+                            # Close the seam onto the envelope fill's leading
+                            # edge: if this zone was active right up through the
+                            # row immediately preceding where valid_env (and
+                            # hence the main env_Mb/M descriptor) takes over,
+                            # extend the polygon to (age[ch[0]], env_Mb[ch[0]] /
+                            # M[ch[0]]) -- the SAME physical convective-zone
+                            # boundary, just described by a different column at
+                            # that row -- so the two fills meet with no white
+                            # sliver between them (STAREVOL hands the
+                            # description off between consecutive samples; conv1
+                            # and env_* never overlap).
+                            if int(abs_idx[e]) == int(ch[0]) - 1:
+                                seam_age_g = float(age_gyr.iloc[ch[0]])
+                                seam_mt_g = float(m_tot.iloc[ch[0]])
+                                seam_mb_g = float(m_base.iloc[ch[0]])
+                                prev_age_g = float(x_part[-1])
+                                prev_mb_g = float(mb_part[-1])
+                                x_part = np.concatenate([x_part, [seam_age_g]])
+                                mt_part = np.concatenate([mt_part, [seam_mt_g]])
+                                mb_part = np.concatenate([mb_part, [seam_mb_g]])
+
+                                # The lower-boundary transition above is a diagonal
+                                # ramp from (prev_age, prev_mb≈0) -- the zone's last
+                                # known extent, reaching the centre -- to (seam_age,
+                                # seam_mb): the radiative core's first measured size.
+                                # That diagonal is also this zone's fill-polygon edge,
+                                # but the radiative-mask polygons (drawn elsewhere,
+                                # tinted by evolutionary stage) only start AT the seam
+                                # row, so the thin triangle between the diagonal, the
+                                # seam's vertical line and y=prev_mb is left unpainted
+                                # -- a "white triangle" sliver (negligible in mass mode
+                                # where the jump is tiny, glaring in radius mode where
+                                # it spans a real fraction of R). Paint that sliver
+                                # here with the same stage colour the mask would use,
+                                # so the seam is gap-free on both sides.
+                                if (seam_mb_g > prev_mb_g) and (ph is not None):
+                                    _seam_phase = ph.iloc[ch[0]]
+                                    if np.isfinite(_seam_phase):
+                                        _seam_phase_i = int(_seam_phase)
+                                        for _ph_set, _mask_c in cfg.kipp.stage_specs():
+                                            if _seam_phase_i in _ph_set:
+                                                fig.add_trace(go.Scatter(
+                                                    x=[prev_age_g, seam_age_g, seam_age_g],
+                                                    y=_floor_y_log([prev_mb_g, seam_mb_g, prev_mb_g]),
+                                                    mode="lines",
+                                                    showlegend=False,
+                                                    legendgroup=model_name,
+                                                    line={"width": 0},
+                                                    fill="toself",
+                                                    fillcolor=_mask_c,
+                                                    hoverinfo="skip",
+                                                ))
+                                                break
+
                             x_poly_zone = np.concatenate([x_part, x_part[::-1]])
                             y_poly_zone = np.concatenate([mt_part, mb_part[::-1]])
 
                             fig.add_trace(go.Scatter(
                                 x=x_poly_zone,
-                                y=y_poly_zone,
+                                y=_floor_y_log(y_poly_zone),
                                 mode="lines",
                                 showlegend=False,
                                 legendgroup=model_name,
@@ -1989,8 +3126,8 @@ def build_server(roots: list[str], port: int = 8050):
 
                         phase_arr = df["phase"].iloc[ch].to_numpy(dtype=int)
 
-                        # env_Mb = lower boundary of convective envelope
-                        env_mb_arr = pd.to_numeric(df["env_Mb"].iloc[ch], errors="coerce").to_numpy(dtype=float)
+                        # lower boundary of convective envelope (mass or radius coordinate)
+                        env_mb_arr = m_base.iloc[ch].to_numpy(dtype=float)
 
                         present_th = (mt_th != 0.0) & (phase_arr == 3) & (mb_th < env_mb_arr)
                         if np.any(present_th):
@@ -2020,7 +3157,7 @@ def build_server(roots: list[str], port: int = 8050):
 
                                 fig.add_trace(go.Scatter(
                                     x=x_poly_th,
-                                    y=y_poly_th,
+                                    y=_floor_y_log(y_poly_th),
                                     mode="lines",
                                     showlegend=False,
                                     legendgroup=model_name,
@@ -2029,6 +3166,59 @@ def build_server(roots: list[str], port: int = 8050):
                                     fillcolor=cfg.kipp.thermo_fill,  # reddish semi-transparent
                                     hoverinfo="skip",
                                 ))
+
+                    # --- Nuclear burning zones (H/He/C/Ne) ---
+                    # Same drawing recipe as the thermohaline zone above, but drawn simply
+                    # wherever the zone is active (Mt != 0) -- no phase/envelope constraints,
+                    # since burning zones can sit anywhere in the star (core or shell).
+                    # Rows where base == top exactly carry zero thickness -- the "fill"
+                    # there would be a zero-area sliver that Plotly still strokes as a
+                    # bare line, so they're excluded from "present" entirely (this also
+                    # naturally splits the zone into separate segments around such a
+                    # pinch, rather than drawing a flat zero-height stretch through it).
+                    for burn_mt, burn_mb, burn_fill, burn_line in burn_zones_data:
+                        mt_b = burn_mt.iloc[ch].to_numpy(dtype=float)
+                        mb_b = burn_mb.iloc[ch].to_numpy(dtype=float)
+                        x_b = age_gyr.iloc[ch].to_numpy(dtype=float)
+
+                        present_b = (mt_b != 0.0) & (mt_b != mb_b)
+                        if not np.any(present_b):
+                            continue
+
+                        idxs_b = np.where(present_b)[0]
+                        cuts_b = np.where(np.diff(idxs_b) > 1)[0] + 1
+                        segs_b = np.split(idxs_b, cuts_b)
+
+                        for seg_b in segs_b:
+                            if seg_b.size < 2:
+                                continue
+
+                            s_b = int(seg_b[0])
+                            e_b = int(seg_b[-1])
+
+                            x_part = x_b[s_b:e_b + 1]
+                            mt_part = mt_b[s_b:e_b + 1]
+                            mb_part = mb_b[s_b:e_b + 1]
+
+                            if (mb_part[0] == 0.0) and (mt_part[0] != 0.0) and (s_b > 0):
+                                x_part = np.concatenate([[x_b[s_b - 1]], x_part])
+                                mt_part = np.concatenate([[0.0], mt_part])
+                                mb_part = np.concatenate([[0.0], mb_part])
+
+                            x_poly_b = np.concatenate([x_part, x_part[::-1]])
+                            y_poly_b = np.concatenate([mt_part, mb_part[::-1]])
+
+                            fig.add_trace(go.Scatter(
+                                x=x_poly_b,
+                                y=_floor_y_log(y_poly_b),
+                                mode="lines",
+                                showlegend=False,
+                                legendgroup=model_name,
+                                line={"color": burn_line, "width": 1},  # no border
+                                fill="toself",
+                                fillcolor=burn_fill,
+                                hoverinfo="skip",
+                            ))
 
                     # "rings" stipple fill as a deterministic grid (no randomness).
                     # Spacing is defined in fractions of the shown x-range and of envelope thickness.
@@ -2075,30 +3265,84 @@ def build_server(roots: list[str], port: int = 8050):
 
                         # Interpolate boundaries; clamp x into data range to avoid extrap artifacts
                         xg_clamped = np.clip(xg, float(xs[0]), float(xs[-1]))
-                        mb_g = np.interp(xg_clamped, xs, mbs)
-                        mt_g = np.interp(xg_clamped, xs, mts)
+                        mb_g = _interp_boundary(xg_clamped, xs, mbs)
+                        mt_g = _interp_boundary(xg_clamped, xs, mts)
 
-                        # y-grid in fractions of CURRENT visible y-range (full plot height)
-                        y0 = 0.0
-                        y1 = float(np.nanmax(m_tot.to_numpy())) if m_tot.notna().any() else float(np.nanmax(mt_g))
-                        y1 = 1.02 * y1
+                        # y-grid bounds: span the CURRENT visible y-range (full plot height).
                         if y_rng is not None:
-                            y0, y1 = float(y_rng[0]), float(y_rng[1])
+                            if y_log_mode:
+                                # Plotly reports a log-axis zoom range in log10 units.
+                                y0, y1 = 10.0 ** float(y_rng[0]), 10.0 ** float(y_rng[1])
+                            else:
+                                y0, y1 = float(y_rng[0]), float(y_rng[1])
                             if y1 < y0:
                                 y0, y1 = y1, y0
+                        elif y_log_mode:
+                            # A log axis can't include zero -- span the full
+                            # positive extent of ALL zones (envelope + every
+                            # conv zone + thermohaline; the same data y_floor
+                            # is derived from), not just the envelope's own
+                            # range. A zone whose radius band sits well below
+                            # the envelope's (e.g. a deep convective core) would
+                            # otherwise get NO grid rows landing inside its
+                            # [mb, mt] band whenever the two ranges don't
+                            # overlap -- silently skipping its rings entirely.
+                            if y_floor is not None and y_data_max is not None and y_data_max > y_floor:
+                                y0 = y_floor
+                                y1 = 1.02 * y_data_max
+                            else:
+                                pos_b = mb_g[mb_g > 0]
+                                pos_t = mt_g[mt_g > 0]
+                                y0 = float(np.nanmin(pos_b)) if pos_b.size else (
+                                    float(np.nanmin(pos_t)) if pos_t.size else 1e-3)
+                                y1 = float(np.nanmax(pos_t)) if pos_t.size else y0 * 10.0
+                                y1 = 1.02 * y1
+                        else:
+                            y0 = 0.0
+                            y1 = float(np.nanmax(m_tot.to_numpy())) if m_tot.notna().any() else float(np.nanmax(mt_g))
+                            y1 = 1.02 * y1
+
+                        def _y_at(frac):
+                            """Map a fraction of the plot height [0,1] to a data
+                            y-value -- geometric spacing on a log axis, linear
+                            spacing on a linear one -- so points laid out at
+                            evenly-spaced fractions appear evenly spaced on screen."""
+                            if y_log_mode:
+                                return y0 * (y1 / y0) ** frac
+                            return y0 + frac * (y1 - y0)
+
+                        def _shift(value, frac):
+                            """Shift a y boundary "up" by `frac` of the plot height
+                            (negative shifts down): additive on a linear axis,
+                            multiplicative on a log one, since a fixed pixel gap is
+                            a fixed *ratio* in data space when the axis is log."""
+                            if y_log_mode:
+                                return value * (y1 / y0) ** frac
+                            return value + frac * (y1 - y0)
 
                         fy = np.linspace(0.0, 1, NY)  # fractions of full plot height
-                        y_grid = y0 + fy * (y1 - y0)
-
-                        # Build full x-y grid
-                        x_pts = np.repeat(xg, NY)
-                        y_pts = np.tile(y_grid, xg.size)
+                        y_grid = _y_at(fy)
 
                         if NY >= 2:
-                            dy = (y1 - y0) / (NY - 1)
-                            col_idx = np.repeat(np.arange(xg.size), NY)
-                            y_pts = y_pts + (col_idx % 2) * (0.5 * dy)
-                            y_pts = np.clip(y_pts, y0, y1)
+                            d_frac = 1.0 / (NY - 1)
+                            col_idx_base = np.arange(xg.size)
+                        else:
+                            d_frac = 0.0
+                            col_idx_base = np.arange(xg.size)
+
+                        def _grid_points(xg_local):
+                            """Build the (x, y) stipple grid: evenly-spaced fractions
+                            of plot height per column, with every other column
+                            offset by half a row for a brick-like stipple pattern."""
+                            xp = np.repeat(xg_local, NY)
+                            frac_p = np.tile(fy, xg_local.size)
+                            if NY >= 2:
+                                col_idx = np.repeat(col_idx_base[:xg_local.size], NY)
+                                frac_p = np.clip(frac_p + (col_idx % 2) * (0.5 * d_frac), 0.0, 1.0)
+                            return xp, _y_at(frac_p)
+
+                        # Build full x-y grid
+                        x_pts, y_pts = _grid_points(xg)
 
                         # Keep only points that lie inside the envelope at each x
                         mb_rep = np.repeat(mb_g, NY)
@@ -2106,10 +3350,9 @@ def build_server(roots: list[str], port: int = 8050):
 
                         # Padding so marker radius doesn't cross the boundary visually
                         plot_h = fig.layout.height or 700  # fallback if height is not set
-                        eps_marker = (0.55 * (ring_size + 2) / float(plot_h)) * (y1 - y0)
+                        eps_frac = max(1e-9, 0.55 * (ring_size + 2) / float(plot_h))
 
-                        eps = max(1e-9 * (y1 - y0), eps_marker)
-                        inside = (y_pts >= (mb_rep + eps)) & (y_pts <= (mt_rep - eps))
+                        inside = (y_pts >= _shift(mb_rep, eps_frac)) & (y_pts <= _shift(mt_rep, -eps_frac))
 
                         x_pts = x_pts[inside]
                         y_pts = y_pts[inside]
@@ -2131,64 +3374,96 @@ def build_server(roots: list[str], port: int = 8050):
                         ))
 
                         for zone_num, mt_series, mb_series in conv_zones_data:
-                            mts_zone_raw = mt_series.iloc[ch].to_numpy()
-                            mbs_zone_raw = mb_series.iloc[ch].to_numpy()
+                            mt_zone_raw = mt_series.iloc[ch_zones].to_numpy(dtype=float)
+                            mb_zone_raw = mb_series.iloc[ch_zones].to_numpy(dtype=float)
+                            x_zone_raw = age_gyr.iloc[ch_zones].to_numpy(dtype=float)
 
-                            if not (np.any(mts_zone_raw != 0) or np.any(mbs_zone_raw != 0)):
-                                continue
-
-                            x_seg_zone = age_gyr.iloc[ch].to_numpy().astype(float)
-                            mb_seg_zone = mbs_zone_raw.astype(float)
-                            mt_seg_zone = mts_zone_raw.astype(float)
-
-                            order_zone = np.argsort(x_seg_zone)
-                            xs_zone = x_seg_zone[order_zone]
-                            mbs_zone = mb_seg_zone[order_zone]
-                            mts_zone = mt_seg_zone[order_zone]
-
-                            good_zone = (
-                                    np.isfinite(xs_zone) & np.isfinite(mbs_zone) & np.isfinite(mts_zone)
-                                    & (mts_zone > mbs_zone)
-                                    & (mts_zone != 0)
+                            present_zone = (mt_zone_raw != 0.0) | (mb_zone_raw != 0.0)
+                            _env_mb_z = m_base.iloc[ch_zones].to_numpy(dtype=float)
+                            _env_mt_z = m_tot.iloc[ch_zones].to_numpy(dtype=float)
+                            present_zone = present_zone & ~(
+                                (_env_mb_z > 0) & (mb_zone_raw >= _env_mb_z) & (mt_zone_raw <= _env_mt_z)
                             )
-
-                            xs_zone = xs_zone[good_zone]
-                            mbs_zone = mbs_zone[good_zone]
-                            mts_zone = mts_zone[good_zone]
-
-                            if xs_zone.size < 2:
+                            if not np.any(present_zone):
                                 continue
 
-                            # Interpolate zone boundaries onto the grid
-                            xg_clamped_zone = np.clip(xg, float(xs_zone[0]), float(xs_zone[-1]))
-                            mb_g_zone = np.interp(xg_clamped_zone, xs_zone, mbs_zone)
-                            mt_g_zone = np.interp(xg_clamped_zone, xs_zone, mts_zone)
+                            # Grid of points for this zone (shared by all its segments)
+                            x_pts_zone, y_pts_zone = _grid_points(xg)
 
-                            # Grid of points for this zone
-                            x_pts_zone = np.repeat(xg, NY)
-                            y_pts_zone = np.tile(y_grid, xg.size)
+                            inside_zone = np.zeros(x_pts_zone.shape, dtype=bool)
 
-                            if NY >= 2:
-                                dy = (y1 - y0) / (NY - 1)
-                                col_idx = np.repeat(np.arange(xg.size), NY)
-                                y_pts_zone = y_pts_zone + (col_idx % 2) * (0.5 * dy)
-                                y_pts_zone = np.clip(y_pts_zone, y0, y1)
+                            # Walk contiguous "exists" runs separately — exactly the
+                            # same segmentation the filled zone polygon and the
+                            # boundary contour use — so a zone with two disjoint
+                            # lifetimes (e.g. an early fully-convective phase and a
+                            # much-later separate core-convection phase) never gets
+                            # bridged by a single phantom np.interp band spanning the
+                            # gap between them.
+                            idxs_zone = np.where(present_zone)[0]
+                            cuts_zone = np.where(np.diff(idxs_zone) > 1)[0] + 1
+                            for seg in np.split(idxs_zone, cuts_zone):
+                                if seg.size < 2:
+                                    continue
+                                s, e = int(seg[0]), int(seg[-1])
+                                xs_seg = x_zone_raw[s:e + 1]
+                                mts_seg = mt_zone_raw[s:e + 1]
+                                mbs_seg = mb_zone_raw[s:e + 1]
 
-                            # Filter points inside the zone
-                            mb_rep_zone = np.repeat(mb_g_zone, NY)
-                            mt_rep_zone = np.repeat(mt_g_zone, NY)
+                                # Same "grows from zero" diagonal taper as the filled
+                                # zone polygon's "prepend" trick (see ~line 2478) and
+                                # the boundary contour's _capped_segment — so the rings
+                                # follow the exact same outline as the fill/contour
+                                # instead of stopping abruptly at the first "real"
+                                # sample and leaving the tapered sliver bare.
+                                if (mbs_seg[0] == 0.0) and (mts_seg[0] != 0.0) and (s > 0):
+                                    xs_seg = np.concatenate([[x_zone_raw[s - 1]], xs_seg])
+                                    mts_seg = np.concatenate([[0.0], mts_seg])
+                                    mbs_seg = np.concatenate([[0.0], mbs_seg])
 
-                            # Use the same offset for markers
-                            inside_zone = (y_pts_zone >= (mb_rep_zone + eps)) & (y_pts_zone <= (mt_rep_zone - eps))
+                                # Same seam-closing extension as the fill polygon
+                                # (see ~line 2510): if this zone's presence run
+                                # ends on the row right before chunks[0] starts,
+                                # extend the interpolation domain to (age[ch[0]],
+                                # env_Mb[ch[0]] / M[ch[0]]) -- the env descriptor's
+                                # first point, i.e. the same physical boundary --
+                                # so rings are drawn across the connecting sliver
+                                # too instead of stopping bare at the seam.
+                                if int(ch_zones[e]) == int(ch[0]) - 1:
+                                    xs_seg = np.concatenate([xs_seg, [float(age_gyr.iloc[ch[0]])]])
+                                    mts_seg = np.concatenate([mts_seg, [float(m_tot.iloc[ch[0]])]])
+                                    mbs_seg = np.concatenate([mbs_seg, [float(m_base.iloc[ch[0]])]])
 
-                            x_pts_zone = x_pts_zone[inside_zone]
-                            y_pts_zone = y_pts_zone[inside_zone]
+                                if xs_seg.size < 2:
+                                    continue
+
+                                # Interpolate this segment's boundaries onto the grid;
+                                # clamp x into the segment's own range to avoid
+                                # extrapolation, and exclude grid columns outside it
+                                # (otherwise rings would leak into a phantom constant-
+                                # width band beyond where this segment actually ends).
+                                xg_clamped_seg = np.clip(xg, float(xs_seg[0]), float(xs_seg[-1]))
+                                mb_g_seg = _interp_boundary(xg_clamped_seg, xs_seg, mbs_seg)
+                                mt_g_seg = _interp_boundary(xg_clamped_seg, xs_seg, mts_seg)
+                                in_seg_x = (xg >= float(xs_seg[0])) & (xg <= float(xs_seg[-1]))
+
+                                mb_rep_seg = np.repeat(mb_g_seg, NY)
+                                mt_rep_seg = np.repeat(mt_g_seg, NY)
+                                in_seg_x_rep = np.repeat(in_seg_x, NY)
+
+                                inside_zone |= (
+                                    in_seg_x_rep
+                                    & (y_pts_zone >= _shift(mb_rep_seg, eps_frac))
+                                    & (y_pts_zone <= _shift(mt_rep_seg, -eps_frac))
+                                )
+
+                            x_pts_sel = x_pts_zone[inside_zone]
+                            y_pts_sel = y_pts_zone[inside_zone]
 
                             # Draw rings for this zone
-                            if x_pts_zone.size > 0:
+                            if x_pts_sel.size > 0:
                                 fig.add_trace(go.Scatter(
-                                    x=x_pts_zone,
-                                    y=y_pts_zone,
+                                    x=x_pts_sel,
+                                    y=y_pts_sel,
                                     mode="markers",
                                     showlegend=False,
                                     legendgroup=model_name,
@@ -2274,7 +3549,7 @@ def build_server(roots: list[str], port: int = 8050):
                                         x_poly_sh = np.concatenate([x_m, x_m[::-1]])
                                         y_poly_sh = np.concatenate([mb_m, np.zeros(mb_m.size)])
                                         fig.add_trace(go.Scatter(
-                                            x=x_poly_sh, y=y_poly_sh,
+                                            x=x_poly_sh, y=_floor_y_log(y_poly_sh),
                                             mode="lines", showlegend=False,
                                             legendgroup=model_name,
                                             line={"width": 0}, fill="toself",
@@ -2418,7 +3693,7 @@ def build_server(roots: list[str], port: int = 8050):
                                             y_poly_m = np.concatenate([hi_cb, lo_cb[::-1]])
                                             fig.add_trace(go.Scatter(
                                                 x=x_poly_m,
-                                                y=y_poly_m,
+                                                y=_floor_y_log(y_poly_m),
                                                 mode="lines",
                                                 showlegend=False,
                                                 legendgroup=model_name,
@@ -2539,7 +3814,7 @@ def build_server(roots: list[str], port: int = 8050):
                                                 y_poly_m = np.concatenate([hi_cb, lo_cb[::-1]])
                                                 fig.add_trace(go.Scatter(
                                                     x=x_poly_m,
-                                                    y=y_poly_m,
+                                                    y=_floor_y_log(y_poly_m),
                                                     mode="lines",
                                                     showlegend=False,
                                                     legendgroup=model_name,
@@ -2726,7 +4001,7 @@ def build_server(roots: list[str], port: int = 8050):
                                             y_poly = [lo0, lo1, hi1, hi0, lo0]
                                             fig.add_trace(go.Scatter(
                                                 x=x_poly,
-                                                y=y_poly,
+                                                y=_floor_y_log(y_poly),
                                                 mode="lines",
                                                 showlegend=False,
                                                 legendgroup=model_name,
@@ -2744,7 +4019,7 @@ def build_server(roots: list[str], port: int = 8050):
                         threshold = 1e-9
                         nonzero_mask = y_base_line > threshold
 
-                        if (ch is chunks[0]) and nonzero_mask.any():
+                        if (ch is chunks[0]) and (not lead_gap_covered) and nonzero_mask.any():
                             first_nonzero_idx = np.where(nonzero_mask)[0][0]
                             x_first = x_base_line[first_nonzero_idx]
                             y_first = y_base_line[first_nonzero_idx]
@@ -2757,7 +4032,7 @@ def build_server(roots: list[str], port: int = 8050):
                             # Add these points before the rest of the line
                             x_base_line = np.concatenate([x_prepend, x_base_line[first_nonzero_idx:]])
                             y_base_line = np.concatenate([y_prepend, y_base_line[first_nonzero_idx:]])
-                        elif (ch is chunks[0]) and (x_base_line.size > 0) and (float(x_base_line[0]) > 0.0):
+                        elif (ch is chunks[0]) and (not lead_gap_covered) and (x_base_line.size > 0) and (float(x_base_line[0]) > 0.0):
                             # Fallback: just add point at (0,0) if all values are near zero
                             x_base_line = np.concatenate([[0.0], x_base_line])
                             y_base_line = np.concatenate([[0.0], y_base_line])
@@ -2776,8 +4051,16 @@ def build_server(roots: list[str], port: int = 8050):
                         x_surf_line = age_gyr.iloc[ch].to_numpy()
                         y_surf_line = m_tot.iloc[ch].to_numpy()
 
-                        # Add initial point at x=0 if needed (same logic as polygon)
-                        if (ch is chunks[0]) and (x_surf_line.size > 0) and (float(x_surf_line[0]) > 0.0):
+                        # Add initial point at x=0 if needed (same logic as polygon).
+                        # Gated on (not lead_gap_covered): when a conv zone already
+                        # traces this leading gap with its own (correct, varying-R)
+                        # contour, prepending a flat (0, m_tot[ch[0]]) segment here
+                        # would overlay a spurious horizontal chord across it -- in
+                        # mass mode this is invisible (m_tot is ~constant, so the flat
+                        # line hugs the zone's own surface-coincident edge), but in
+                        # radius mode R varies sharply with age and the chord cuts
+                        # visibly across the zone's sloped boundary.
+                        if (ch is chunks[0]) and (not lead_gap_covered) and (x_surf_line.size > 0) and (float(x_surf_line[0]) > 0.0):
                             x_surf_line = np.concatenate([[0.0], x_surf_line])
                             y_surf_line = np.concatenate([[float(y_surf_line[0])], y_surf_line])
 
@@ -2793,36 +4076,143 @@ def build_server(roots: list[str], port: int = 8050):
 
                         # Redraw boundaries of additional convective zones on top of masks
                         for zone_num, mt_series, mb_series in conv_zones_data:
-                            mts_zone = mt_series.iloc[ch].to_numpy()
-                            mbs_zone = mb_series.iloc[ch].to_numpy()
+                            mts_zone = mt_series.iloc[ch_zones].to_numpy()
+                            mbs_zone = mb_series.iloc[ch_zones].to_numpy()
 
                             # Check zone existence
                             if not (np.any(mts_zone != 0) or np.any(mbs_zone != 0)):
                                 continue
 
-                            age_zone = age_gyr.iloc[ch].to_numpy()
+                            age_zone = age_gyr.iloc[ch_zones].to_numpy()
+                            abs_idx_zone = ch_zones.copy()
+                            env_mb_ctr = m_base.iloc[ch_zones].to_numpy(dtype=float)
+                            env_mt_ctr = m_tot.iloc[ch_zones].to_numpy(dtype=float)
 
-                            # Add initial point at x=0 if needed (same logic as polygon)
-                            if (ch is chunks[0]) and (age_zone.size > 0) and (float(age_zone[0]) > 0.0):
+                            # Add initial point at x=0 if needed (same logic as polygon).
+                            # Gate on ch_zones[0] == 0 (not "ch is chunks[0]"): with the
+                            # extended ch_zones range, the chunk that needs this isn't
+                            # necessarily chunks[0] -- it's whichever iteration's
+                            # ch_zones happens to start at the very first data row.
+                            if (ch_zones[0] == 0) and (age_zone.size > 0) and (float(age_zone[0]) > 0.0):
                                 age_zone = np.concatenate([[0.0], age_zone])
                                 mts_zone = np.concatenate([[float(mts_zone[0])], mts_zone])
                                 mbs_zone = np.concatenate([[float(mbs_zone[0])], mbs_zone])
+                                env_mb_ctr = np.concatenate([[float(env_mb_ctr[0])], env_mb_ctr])
+                                env_mt_ctr = np.concatenate([[float(env_mt_ctr[0])], env_mt_ctr])
+                                abs_idx_zone = np.concatenate([[-1], abs_idx_zone])
 
-                            m_surf = m_tot.iloc[ch].to_numpy()
-                            if (ch is chunks[0]) and (m_surf.size > 0) and (float(m_surf[0]) > 0.0):
+                            m_surf = m_tot.iloc[ch_zones].to_numpy()
+                            if (ch_zones[0] == 0) and (m_surf.size > 0) and (float(m_surf[0]) > 0.0):
                                 # Add the same initial point for comparison
                                 m_surf = np.concatenate([[float(m_surf[0])], m_surf])
 
+                            # Canonical env values at the seam row (chunks[0][0]) -- the
+                            # same physical boundary this zone's sentinel-adjacent last
+                            # row is "handed off" to. Used to extend a segment ending at
+                            # chunks[0][0]-1 so the contour matches the fill polygon's
+                            # seam-closing edge (~line 2510) instead of the old short
+                            # cap onto this row's own (0,0)-sentinel-adjacent values.
+                            seam_age = float(age_gyr.iloc[ch[0]])
+                            seam_mt = float(m_tot.iloc[ch[0]])
+                            seam_mb = float(m_base.iloc[ch[0]])
+
+                            # Exclude timesteps where this zone is fully nested inside the
+                            # envelope (same condition as the polygon-fill loop above).
+                            nested_ctr = (env_mb_ctr > 0) & (mbs_zone >= env_mb_ctr) & (mts_zone <= env_mt_ctr)
+
                             tolerance = 1e-6
-                            valid_mt = mts_zone != 0
-
                             not_surface = np.abs(mts_zone - m_surf) > tolerance
-                            valid_mt = valid_mt & not_surface
+                            valid_mt = (mts_zone != 0) & not_surface & ~nested_ctr
 
-                            if np.any(valid_mt):
+                            # A zone genuinely appears/disappears (as opposed to merging
+                            # with the surface, which "not_surface" already excludes) at
+                            # samples where BOTH mt and mb are recorded as the file's
+                            # "this zone slot is inactive" sentinel (mt == mb == 0).
+                            zone_absent = (mts_zone == 0) & (mbs_zone == 0)
+
+                            def _capped_segment(idxs, ys_self, ys_other, canon_self, canon_other):
+                                """Build (x, y) for a contiguous run, closing it onto
+                                the filled zone polygon's actual outline at birth/death
+                                — which is itself asymmetric AND conditional:
+
+                                * At the START, the fill polygon's "prepend" block
+                                  inserts a (previous-age, 0) vertex — producing a
+                                  DIAGONAL ramp from the neighbouring age up to the
+                                  first real point — but ONLY when the zone is born
+                                  right at the stellar centre (mb == 0 and mt != 0).
+                                  For zones/segments that appear away from the centre
+                                  (e.g. internal zones, or brief blips), the fill has
+                                  no such prepend and simply closes with a short
+                                  VERTICAL edge at the same age. We must branch the
+                                  same way, or else those segments grow a long bogus
+                                  diagonal spike all the way down to y=0.
+                                * At the END there is never a prepend EXCEPT for the
+                                  one seam case where this run ends at chunks[0][0]-1
+                                  — there the fill polygon extends its edge out to
+                                  (seam_age, env's canonical values) instead of
+                                  capping at this row's own values (canon_self/
+                                  canon_other carry those env values, pre-selected by
+                                  the caller to match ys_self/ys_other's roles). In
+                                  every other case the polygon still closes with a
+                                  plain VERTICAL edge straight down (or up) from the
+                                  last real point to the opposite boundary's value at
+                                  that same age — we add the same vertical cap here.
+
+                                Matching this exactly ensures the contour and rings
+                                agree with the green fill's actual outline instead of
+                                drawing spurious bold near-vertical lines where the
+                                fill only has a thin natural wall."""
+                                seg_x = age_zone[idxs]
+                                seg_y = ys_self[idxs]
+                                i0, i1 = int(idxs[0]), int(idxs[-1])
+                                if i0 > 0 and zone_absent[i0 - 1]:
+                                    if (mbs_zone[i0] == 0.0) and (mts_zone[i0] != 0.0):
+                                        seg_x = np.concatenate([[age_zone[i0 - 1]], seg_x])
+                                        seg_y = np.concatenate([[0.0], seg_y])
+                                    else:
+                                        seg_x = np.concatenate([[age_zone[i0]], seg_x])
+                                        seg_y = np.concatenate([[ys_other[i0]], seg_y])
+                                if i1 < zone_absent.size - 1 and zone_absent[i1 + 1]:
+                                    if int(abs_idx_zone[i1]) == int(ch[0]) - 1:
+                                        # Seam case: STAREVOL hands the description off in a
+                                        # single timestep (no intermediate samples), so the
+                                        # *fill* polygon must stretch its edge out to (seam_age,
+                                        # canon_*) to stay gap-free -- but redrawing that long
+                                        # edge here too, in the bold boundary_line style, makes
+                                        # an honest one-step data jump look like a rendering
+                                        # "spike". Leave it to the fill polygon's own thin,
+                                        # semi-transparent border to close the seam quietly.
+                                        pass
+                                    else:
+                                        seg_x = np.concatenate([seg_x, [age_zone[i1]]])
+                                        seg_y = np.concatenate([seg_y, [ys_other[i1]]])
+
+                                # A "born/dies at the centre" cap (and any raw
+                                # zone-boundary sample of exactly 0) carries a
+                                # y<=0 vertex -- impossible on a log radius axis.
+                                # Plotly can't draw a segment to/from such a point,
+                                # so the line appears to spring up out of nowhere at
+                                # its first valid neighbour, looking like a bogus
+                                # vertical edge. Floor it to y_floor exactly like the
+                                # fill polygon already does (_floor_y_log above) so
+                                # the contour traces the SAME diagonal ramp the fill
+                                # actually shows, instead of an invalid jump.
+                                return seg_x, _floor_y_log(seg_y)
+
+                            # Draw upper boundary segment-wise (contiguous runs only) —
+                            # connecting non-adjacent valid points with a straight line
+                            # would draw a spurious chord across the gap between them
+                            # (e.g. between an early near-surface stretch of this zone
+                            # and a much-later deep-interior stretch).
+                            idxs_mt = np.where(valid_mt)[0]
+                            cuts_mt = np.where(np.diff(idxs_mt) > 1)[0] + 1
+                            for seg_mt in np.split(idxs_mt, cuts_mt):
+                                if seg_mt.size < 2:
+                                    continue
+                                seg_x, seg_y = _capped_segment(seg_mt, mts_zone, mbs_zone, seam_mt, seam_mb)
                                 fig.add_trace(go.Scatter(
-                                    x=age_zone[valid_mt],
-                                    y=mts_zone[valid_mt],
+                                    x=seg_x,
+                                    y=seg_y,
                                     mode="lines",
                                     showlegend=False,
                                     legendgroup=model_name,
@@ -2830,12 +4220,17 @@ def build_server(roots: list[str], port: int = 8050):
                                     hoverinfo="skip",
                                 ))
 
-                            # Draw lower boundary of the zone
-                            valid_mb = mbs_zone != 0
-                            if np.any(valid_mb):
+                            # Draw lower boundary of the zone (same segment-wise approach)
+                            valid_mb = (mbs_zone != 0) & ~nested_ctr
+                            idxs_mb = np.where(valid_mb)[0]
+                            cuts_mb = np.where(np.diff(idxs_mb) > 1)[0] + 1
+                            for seg_mb in np.split(idxs_mb, cuts_mb):
+                                if seg_mb.size < 2:
+                                    continue
+                                seg_x, seg_y = _capped_segment(seg_mb, mbs_zone, mts_zone, seam_mb, seam_mt)
                                 fig.add_trace(go.Scatter(
-                                    x=age_zone[valid_mb],
-                                    y=mbs_zone[valid_mb],
+                                    x=seg_x,
+                                    y=seg_y,
                                     mode="lines",
                                     showlegend=False,
                                     legendgroup=model_name,
@@ -2846,9 +4241,10 @@ def build_server(roots: list[str], port: int = 8050):
                 # Axes styling (paper-like look)
                 fig.update_layout(
                     xaxis_title=r"$\mathrm{Age},\ \mathrm{Gyr}$",
-                    yaxis_title=r"$\mathrm{m},\ \mathrm{M}_{\odot}$",
+                    yaxis_title=(r"$\mathrm{r},\ \mathrm{R}_{\odot}$" if kipp_radius_mode
+                                 else r"$\mathrm{m},\ \mathrm{M}_{\odot}$"),
                 )
-                fig.update_yaxes(type="linear")
+                fig.update_yaxes(type="log" if (kipp_radius_mode and yscale_eff == "log") else "linear")
                 fig.update_yaxes(showgrid=True, gridcolor=cfg.grid_rgba_str, zeroline=False, ticks="outside",
                                  mirror=True,
                                  linecolor="#c0c0c0", layer="above traces", )
@@ -2947,7 +4343,8 @@ def build_server(roots: list[str], port: int = 8050):
             # track color: None = let Plotly cycle automatically
             track_color = None if cfg.track_multicolor else cfg.track_single_color
 
-            model_name = Path(path).name
+            _folder, _stem = parse_model_path(path)
+            model_name = _stem if _stem else _folder.name
             if cfg.legend_max_chars is not None:
                 model_name = model_name[:cfg.legend_max_chars]
 
@@ -2956,24 +4353,48 @@ def build_server(roots: list[str], port: int = 8050):
                 legend_group = model_name
                 legend_shown = False  # show legend entry only for the first phase that actually exists
 
+                # Extract numpy arrays once outside loop — avoids repeated 338k-row conversions
+                phase_arr = valid["__phase"].to_numpy()
+                x_arr = x_plot.to_numpy(dtype=float, na_value=np.nan)
+                y_arr = y_plot.to_numpy(dtype=float, na_value=np.nan)
+
                 for ph in range(phase_min, phase_max + 1):
-                    mask = (valid["__phase"] == ph)
-                    if not mask.any():
+                    mask_arr = (phase_arr == ph)
+                    if not mask_arr.any():
                         continue
 
-                    phase_arr = valid["__phase"].to_numpy()
-                    mask_arr = (phase_arr == ph)
-
-                    # bridge: take the FIRST point right AFTER a run of this phase
-                    # (i.e., where previous point was in this phase, but current point is already next phase)
+                    # bridge: include the first point AFTER each run of this phase
+                    # so the segment line visually ends at the phase boundary
                     bridge_arr = (~mask_arr) & np.concatenate(([False], mask_arr[:-1]))
+                    combined = mask_arr | bridge_arr
 
-                    y_ph = np.where(mask_arr | bridge_arr, y_plot.to_numpy(), None)
+                    # Build compact float64 segments with NaN separators.
+                    # For 338k rows, this sends only the ~N/5 real phase points instead of
+                    # a 338k-element object array — much faster JSON serialisation in Plotly.
+                    transitions = np.diff(combined.astype(np.int8), prepend=0, append=0)
+                    run_starts = np.where(transitions == 1)[0]
+                    run_ends   = np.where(transitions == -1)[0]
+
+                    parts_x: list[np.ndarray] = []
+                    parts_y: list[np.ndarray] = []
+                    nan1 = np.array([np.nan])
+                    for s, e in zip(run_starts, run_ends):
+                        if parts_x:
+                            parts_x.append(nan1)
+                            parts_y.append(nan1)
+                        parts_x.append(x_arr[s:e])
+                        parts_y.append(y_arr[s:e])
+
+                    if not parts_x:
+                        continue
+
+                    x_ph = np.concatenate(parts_x)
+                    y_ph = np.concatenate(parts_y)
 
                     # show_phase always uses phase colors regardless of track_multicolor
                     line_color = PHASE_COLORS[ph]
                     fig.add_trace(Trace(
-                        x=x_plot,
+                        x=x_ph,
                         y=y_ph,
                         mode="lines",
                         name=model_name,
@@ -3171,12 +4592,13 @@ def build_server(roots: list[str], port: int = 8050):
             fig.update_yaxes(tickformat="")
 
         if kipp_env_mode:
-            # fig.update_layout(xaxis_title="Age, Gyr", yaxis_title="m, M\u2609")
             _kipp_unit_label = {"gyr": "Gyr", "myr": "Myr", "yr": "yr"}.get(x_age_units, "Gyr")
             _kipp_x_title = r"$\mathrm{Age},\ \mathrm{" + _kipp_unit_label + r"}$"
+            _kipp_y_title = (r"$\mathrm{r},\ \mathrm{R}_{\odot}$" if kipp_radius_mode
+                             else r"$\mathrm{m},\ \mathrm{M}_{\odot}$")
             fig.update_layout(
                 xaxis_title=_kipp_x_title,
-                yaxis_title=r"$\mathrm{m},\ \mathrm{M}_{\odot}$",
+                yaxis_title=_kipp_y_title,
             )
         else:
             fig.update_layout(xaxis_title=x_title, yaxis_title=y_title)
@@ -3393,7 +4815,30 @@ def build_server(roots: list[str], port: int = 8050):
                     yaxis_kwargs.update(exponentformat="power", showexponent="last")
             fig.update_yaxes(**yaxis_kwargs)
         else:
-            if kipp_env_mode and y_max is not None:
+            if kipp_radius_mode and yscale_eff == "log":
+                # Log scale cannot include zero (envelope base is 0 when absent),
+                # so a plain [0, y_max*1.1] window is impossible -- normally we'd
+                # just let Plotly autorange. But per the user's request the view
+                # should be cropped at the bottom at 1e-2 R_sun (smaller radii are
+                # astrophysically negligible clutter at the star's centre). Splice
+                # that crop into Plotly's own autorange result by reproducing its
+                # log-axis padding formula (empirically: a fixed span/18 on each
+                # side) from the floor/max collected while building the traces,
+                # then raising only the lower edge -- the natural top edge (and
+                # thus the rest of the view) is left exactly as autorange would
+                # have produced it.
+                _LOG_CLIP_MIN = 1e-2
+                if (kipp_y_floor_global is not None and kipp_y_max_global is not None
+                        and kipp_y_max_global > kipp_y_floor_global > 0):
+                    _lo = np.log10(kipp_y_floor_global)
+                    _hi = np.log10(kipp_y_max_global)
+                    _pad = (_hi - _lo) / 18.0
+                    r0 = max(_lo - _pad, np.log10(_LOG_CLIP_MIN))
+                    r1 = _hi + _pad
+                    fig.update_yaxes(type="log", range=[r0, r1], autorange=False, exponentformat="power")
+                else:
+                    fig.update_yaxes(type="log", autorange=True, exponentformat="power")
+            elif kipp_env_mode and y_max is not None:
                 fig.update_yaxes(range=[0.0, float(y_max) * 1.1], autorange=False)
             elif y_is_age and phantom_y_min is not None and phantom_y_max is not None:
                 # For Age, check the selected scale mode
@@ -3535,7 +4980,7 @@ def build_server(roots: list[str], port: int = 8050):
                         yaxis_kwargs.update(exponentformat="power", showexponent="last")
                     fig.update_yaxes(**yaxis_kwargs)
 
-        fig.update_layout(uirevision=f"{xcol}|{ycol}|{tuple(models or [])}")
+        fig.update_layout(uirevision=f"{xcol}|{ycol}|{xscale}|{yscale}|{kipp_coord}|{tuple(models or [])}")
 
         x_tick_size = cfg.axis_tick_font_size
         y_tick_size = cfg.axis_tick_font_size
@@ -3657,207 +5102,56 @@ def build_server(roots: list[str], port: int = 8050):
             )
         )
 
-        if not kipp_env_mode and selected_age > 0 and age_markers_data:
+        # Age-tracker dots: always emit exactly one trace per age_markers_data entry
+        # (with empty x/y when the marker isn't shown for the current age) so the
+        # trace layout is deterministic — this lets slider-only updates patch these
+        # traces in place via Patch() without touching anything else in the figure.
+        marker_start_idx = len(fig.data)
+        if not kipp_env_mode:
             for marker_data in age_markers_data:
-                x_plot = marker_data['x_plot']
-                y_plot = marker_data['y_plot']
-                age_array = marker_data['age_array']
-                x_is_age_flag = marker_data['x_is_age']
-                y_is_age_flag = marker_data['y_is_age']
-
-                if age_array.isna().all():
-                    continue
-
-                max_age_for_model = age_array.max()
-
-                is_at_max_age = False
-
-                if selected_age >= max_age_for_model - 1.0:
-                    last_idx = age_array.last_valid_index()
-                    if pd.isna(last_idx):
-                        continue
-
-                    # If X-axis is Age, the marker must not exceed the model data range
-                    if x_is_age_flag:
-                        # max_age_for_model is in years, convert to displayed units
-                        if xscale_eff == "lin":
-                            marker_x = max_age_for_model * x_age_factor / 1e6
-                        elif xscale_eff == "log(x)":
-                            marker_x = np.log10(max_age_for_model) if max_age_for_model > 0 else None
-                        else:
-                            marker_x = max_age_for_model
-                    else:
-                        marker_x = x_plot.iloc[x_plot.index.get_loc(last_idx)]
-
-                    if y_is_age_flag:
-                        # max_age_for_model is in years, convert to displayed units
-                        if yscale_eff == "lin":
-                            marker_y = max_age_for_model * y_age_factor / 1e6
-                        elif yscale_eff == "log(x)":
-                            marker_y = np.log10(max_age_for_model) if max_age_for_model > 0 else None
-                        else:
-                            marker_y = max_age_for_model
-                    else:
-                        marker_y = y_plot.iloc[y_plot.index.get_loc(last_idx)]
-
-                    is_at_max_age = True
-                else:
-                    interp_df = pd.DataFrame({
-                        'age': age_array,
-                        'x': x_plot,
-                        'y': y_plot
-                    }).dropna().sort_values('age').reset_index(drop=True)
-
-                    if len(interp_df) < 2:
-                        continue
-
-                    if selected_age < interp_df['age'].iloc[0] or selected_age > interp_df['age'].iloc[-1]:
-                        continue
-
-                    result = _interp_age_marker(
-                        interp_df, selected_age,
-                        x_is_age_flag, y_is_age_flag,
-                        xscale_eff, yscale_eff,
-                        x_age_factor, y_age_factor,
-                    )
-                    if result is None:
-                        continue
-                    marker_x, marker_y, _ = result
-
-                if pd.notna(marker_x) and pd.notna(marker_y):
-                    if x_scale is not None and not x_is_age_flag:
-                        marker_x = marker_x / x_scale
-                    if y_scale is not None and not y_is_age_flag:
-                        marker_y = marker_y / y_scale
-
-                    marker_symbol = 'square' if is_at_max_age else 'circle'
-
-                    fig.add_trace(go.Scatter(
-                        x=[marker_x],
-                        y=[marker_y],
-                        mode='markers',
-                        marker=dict(
-                            size=cfg.isochrone_marker_size,
-                            color=cfg.isochrone_marker_color,
-                            symbol=marker_symbol,
-                            line=dict(width=cfg.isochrone_marker_border_width, color='black')
-                        ),
-                        showlegend=False,
-                        hoverinfo='skip',
-                        name=marker_data['model_name']
-                    ))
+                marker_x, marker_y, is_at_max_age = _compute_age_marker_position(
+                    marker_data, selected_age,
+                    xscale_eff, yscale_eff,
+                    x_age_factor, y_age_factor,
+                    x_scale, y_scale,
+                )
+                marker_symbol = 'square' if is_at_max_age else 'circle'
+                fig.add_trace(go.Scatter(
+                    x=[marker_x] if marker_x is not None else [],
+                    y=[marker_y] if marker_y is not None else [],
+                    mode='markers',
+                    marker=dict(
+                        size=cfg.isochrone_marker_size,
+                        color=cfg.isochrone_marker_color,
+                        symbol=marker_symbol,
+                        line=dict(width=cfg.isochrone_marker_border_width, color='black')
+                    ),
+                    showlegend=False,
+                    hoverinfo='skip',
+                    name=marker_data['model_name'],
+                ))
+        marker_count = len(fig.data) - marker_start_idx
 
         # Draw isochrone if enabled and multiple models are selected
         show_isochrone = bool(show_isochrone_value)  # checklist: [] or ["on"]
-        if show_isochrone and models and len(models) >= 2 and selected_age > 0 and age_markers_data:
+        # Isochrone overlay: always emit the trace whenever it's eligible to exist
+        # (>=2 models picked and the checkbox is on), with empty x/y when there
+        # aren't enough points for the current age — same determinism rationale
+        # as the age-tracker dots above, so Patch() can address it reliably.
+        isochrone_idx = None
+        if show_isochrone and models and len(models) >= 2:
             isochrone_points = []
-
-            # Collect all marker points at the selected age from age_markers_data
             for marker_data in age_markers_data:
-                x_plot = marker_data['x_plot']
-                y_plot = marker_data['y_plot']
-                age_array = marker_data['age_array']
-                logg_array = marker_data.get('logg_array')
-                iso_sort_array = marker_data.get('iso_sort_array')
-                iso_sort_val = None  # reset each iteration
-                x_is_age_flag = marker_data['x_is_age']
-                y_is_age_flag = marker_data['y_is_age']
+                point = _compute_isochrone_point(
+                    marker_data, selected_age,
+                    xscale_eff, yscale_eff,
+                    x_age_factor, y_age_factor,
+                    x_scale, y_scale,
+                )
+                if point is not None:
+                    isochrone_points.append(point)
 
-                if age_array.isna().all():
-                    continue
-
-                max_age_for_model = age_array.max()
-
-                # Same interpolation logic as for the age markers
-                marker_x = None
-                marker_y = None
-                marker_logg = None
-
-                if selected_age >= max_age_for_model * 0.999:
-                    # At or near max age - use last valid point
-                    last_idx = age_array.idxmax()
-
-                    if x_is_age_flag:
-                        if xscale_eff == "lin":
-                            marker_x = max_age_for_model * x_age_factor / 1e6
-                        elif xscale_eff == "log(x)":
-                            marker_x = np.log10(max_age_for_model) if max_age_for_model > 0 else None
-                        else:
-                            marker_x = max_age_for_model
-                    else:
-                        marker_x = x_plot.iloc[x_plot.index.get_loc(last_idx)]
-
-                    if y_is_age_flag:
-                        if yscale_eff == "lin":
-                            marker_y = max_age_for_model * y_age_factor / 1e6
-                        elif yscale_eff == "log(x)":
-                            marker_y = np.log10(max_age_for_model) if max_age_for_model > 0 else None
-                        else:
-                            marker_y = max_age_for_model
-                    else:
-                        marker_y = y_plot.iloc[y_plot.index.get_loc(last_idx)]
-
-                    if logg_array is not None:
-                        marker_logg = logg_array.iloc[logg_array.index.get_loc(last_idx)]
-                    iso_sort_val = None
-                    if iso_sort_array is not None:
-                        iso_sort_val = iso_sort_array.iloc[iso_sort_array.index.get_loc(last_idx)]
-                else:
-                    # Interpolate using binary search via _interp_age_marker
-                    extra_cols = []
-                    df_kwargs = {'age': age_array, 'x': x_plot, 'y': y_plot}
-                    dropna_subset = ['age', 'x', 'y']
-
-                    if logg_array is not None:
-                        df_kwargs['logg'] = logg_array
-                        extra_cols.append('logg')
-                    if iso_sort_array is not None:
-                        df_kwargs['iso_sort'] = iso_sort_array
-                        # If logg was not set separately, use iso_sort as logg fallback
-                        if logg_array is None:
-                            df_kwargs['logg'] = iso_sort_array
-                            if 'logg' not in extra_cols:
-                                extra_cols.append('logg')
-                        extra_cols.append('iso_sort')
-
-                    interp_df = (pd.DataFrame(df_kwargs)
-                                 .dropna(subset=dropna_subset)
-                                 .sort_values('age')
-                                 .reset_index(drop=True))
-
-                    if len(interp_df) < 2:
-                        continue
-
-                    if selected_age < interp_df['age'].iloc[0] or selected_age > interp_df['age'].iloc[-1]:
-                        continue
-
-                    result = _interp_age_marker(
-                        interp_df, selected_age,
-                        x_is_age_flag, y_is_age_flag,
-                        xscale_eff, yscale_eff,
-                        x_age_factor, y_age_factor,
-                        extra_cols=extra_cols,
-                    )
-                    if result is None:
-                        continue
-                    marker_x, marker_y, extras = result
-
-                    if 'logg' in extras:
-                        marker_logg = extras['logg']
-                    if 'iso_sort' in extras:
-                        iso_sort_val = float(extras['iso_sort'])
-
-                if pd.notna(marker_x) and pd.notna(marker_y):
-                    if x_scale is not None and not x_is_age_flag:
-                        marker_x = marker_x / x_scale
-                    if y_scale is not None and not y_is_age_flag:
-                        marker_y = marker_y / y_scale
-
-                    if iso_sort_val is None:
-                        iso_sort_val = marker_logg  # fallback to logg if sort col unavailable
-                    isochrone_points.append((marker_x, marker_y, marker_logg, iso_sort_val))
-
-            # Draw isochrone line if we have at least 2 points
+            iso_x, iso_y = [], []
             if len(isochrone_points) >= 2:
                 # Sort by configured column (index 3 = iso_sort_val); fallback to x
                 asc = cfg.isochrone_sort_ascending
@@ -3869,15 +5163,35 @@ def build_server(roots: list[str], port: int = 8050):
                 iso_x = [p[0] for p in isochrone_points]
                 iso_y = [p[1] for p in isochrone_points]
 
-                fig.add_trace(go.Scatter(
-                    x=iso_x,
-                    y=iso_y,
-                    mode='lines',
-                    line=dict(color=cfg.isochrone_line_color, width=cfg.isochrone_line_width),
-                    showlegend=False,
-                    hoverinfo='skip',
-                    name='Isochrone'
-                ))
+            isochrone_idx = len(fig.data)
+            fig.add_trace(go.Scatter(
+                x=iso_x,
+                y=iso_y,
+                mode='lines',
+                line=dict(color=cfg.isochrone_line_color, width=cfg.isochrone_line_width),
+                showlegend=False,
+                hoverinfo='skip',
+                name='Isochrone'
+            ))
+
+        # Snapshot everything the fast age-slider Patch() path needs to recompute
+        # marker/isochrone positions and address the right traces, without redoing
+        # any of the data loading / track building above.
+        AGE_MARKER_CACHE.clear()
+        AGE_MARKER_CACHE.update({
+            'age_markers_data': age_markers_data,
+            'marker_start_idx': marker_start_idx,
+            'marker_count': marker_count,
+            'isochrone_idx': isochrone_idx,
+            'kipp_env_mode': kipp_env_mode,
+            'xscale_eff': xscale_eff,
+            'yscale_eff': yscale_eff,
+            'x_age_factor': x_age_factor,
+            'y_age_factor': y_age_factor,
+            'x_scale': x_scale,
+            'y_scale': y_scale,
+            'max_age_among_models': max_age_tracker[0],
+        })
 
         status = ""
         # Interval should run ONLY while something is loading in background
@@ -3915,29 +5229,15 @@ def build_server(roots: list[str], port: int = 8050):
             for _m_path in models:
                 record_opened(_m_path)
 
-        # --- overlay frozen PNG snapshots as static background images ---
-        # Each entry: {src: cropped_plot_area_png, w: cropW, h: cropH}
-        # The image is exactly the plot area, so it maps to paper [0,1]x[0,1] directly.
-        if frozen_images:
-            bg_images = []
-            for entry in frozen_images:
-                if not isinstance(entry, dict):
-                    continue
-                src = entry.get("src", "")
-                if not src:
-                    continue
-                bg_images.append(dict(
-                    source=src,
-                    xref="paper", yref="paper",
-                    x=0, y=1,
-                    sizex=1, sizey=1,
-                    xanchor="left", yanchor="top",
-                    layer="below",
-                    sizing="stretch",
-                    opacity=0.5,
-                ))
-            if bg_images:
-                fig.update_layout(images=bg_images)
+        # --- overlay frozen PNG snapshots (composited JS-side into frozen-composite store) ---
+        if frozen_composite:
+            fig.update_layout(images=[dict(
+                source=frozen_composite,
+                xref="paper", yref="paper",
+                x=0, y=1, sizex=1, sizey=1,
+                xanchor="left", yanchor="top",
+                layer="below", sizing="stretch", opacity=1.0,
+            )])
 
         return fig, status, interval_disabled, slider_max, slider_marks, corrected_age_input
 

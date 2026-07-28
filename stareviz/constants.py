@@ -146,7 +146,6 @@ AXIS_LABELS_DROPDOWN = {
     "Reff": "Rad",
     "macc": "Accr. rate",
     "__kipp_env": "Kippenhahn diagram",
-    "__kipp_env_r": "Kippenhahn diagram (R)",
     "model": "Nmodel",
     "phase": "Phase",
     "logg": "log g",
